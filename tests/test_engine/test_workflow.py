@@ -8,6 +8,8 @@ Tests cover:
 - Error handling
 """
 
+import sys
+
 import pytest
 
 from conductor.config.schema import (
@@ -297,6 +299,44 @@ class TestWorkflowEngineContextModes:
         assert "agent1" in agent2_context
         # Workflow.input.goal should not be in agent2's context since it's not in input list
         assert "other" not in agent2_context.get("workflow", {}).get("input", {})
+
+    @pytest.mark.asyncio
+    async def test_explicit_mode_script_gets_workflow_inputs(self) -> None:
+        """Regression: script agents in explicit mode see workflow.input.
+
+        ``workflow.input`` is the workflow's external interface — set once at
+        startup and present for the lifetime of the run. For local-render
+        agent types (``script``, ``workflow``) it is always available, even
+        in explicit mode where prior agent outputs remain explicitly declared.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="explicit-script",
+                entry_point="detector",
+                context=ContextConfig(mode="explicit"),
+            ),
+            agents=[
+                AgentDef(
+                    name="detector",
+                    type="script",
+                    command=sys.executable,
+                    args=[
+                        "-c",
+                        "print('{{ workflow.input.work_item_id }}')",
+                    ],
+                    # No input: list — should still see workflow.input
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(config, provider)
+
+        await engine.run({"work_item_id": 42})
+
+        # Script should have rendered the template successfully
+        assert engine.context.agent_outputs["detector"]["stdout"].strip() == "42"
 
 
 class TestWorkflowEngineRouting:

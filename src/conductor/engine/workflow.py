@@ -1653,6 +1653,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _script_start = _time.time()
 
@@ -1745,6 +1746,7 @@ class WorkflowEngine:
                                 agent.name,
                                 agent.input,
                                 mode=self.config.workflow.context.mode,
+                                agent_type=agent.type,
                             )
                             _sub_start = _time.time()
 
@@ -1828,6 +1830,7 @@ class WorkflowEngine:
                             agent.name,
                             agent.input,
                             mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
                         # Execute agent (get executor for multi-provider support)
@@ -2499,6 +2502,7 @@ class WorkflowEngine:
                     agent.name,
                     agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=agent.type,
                 )
 
                 # Execute agent (get executor for multi-provider support)
@@ -2835,6 +2839,7 @@ class WorkflowEngine:
                     for_each_group.agent.name,
                     for_each_group.agent.input,
                     mode=self.config.workflow.context.mode,
+                    agent_type=for_each_group.agent.type,
                 )
 
                 # Inject loop variables into context
