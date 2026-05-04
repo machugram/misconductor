@@ -766,16 +766,64 @@ class WorkflowEngine:
         usage = child_engine.usage_tracker.get_summary()
         return output, usage
 
-    def _get_context_window_for_agent(self, agent: AgentDef) -> int | None:
-        """Return the context window size for an agent's model."""
-        from conductor.engine.pricing import get_pricing
+    async def _get_provider_for_agent(self, agent: AgentDef) -> AgentProvider | None:
+        """Resolve the provider that will (or did) execute ``agent``.
 
-        model = agent.model
-        if not model:
+        Mirrors the executor-resolution logic in ``_get_executor_for_agent``
+        so context-window metadata lookups go through the same provider that
+        handles execution. Returns ``None`` only when no provider can be
+        determined (e.g. transient registry failures); callers must treat
+        ``None`` as "metadata unavailable".
+        """
+        if self._registry is not None:
+            try:
+                return await self._registry.get_provider(agent)
+            except Exception as e:
+                logger.debug("Provider lookup via registry failed for %s: %s", agent.name, e)
+                return None
+        return self._single_provider
+
+    async def _get_context_window_for_agent(
+        self, agent: AgentDef, output: AgentOutput | None = None
+    ) -> int | None:
+        """Return the SDK-reported max prompt tokens for an agent.
+
+        Tries each candidate model in priority order — the model the SDK
+        actually used (``output.model``), the agent's configured model, the
+        workflow's runtime default — and returns the first non-``None``
+        result. This is a real fallback chain: if ``output.model`` is an
+        SDK-specific variant the provider doesn't know about, the lookup
+        retries with ``agent.model`` before giving up.
+
+        Returns ``None`` when no candidate resolves, no provider can be
+        reached, or the provider's metadata call fails — context-window
+        metadata is best-effort and must never break workflow execution.
+        """
+        provider = await self._get_provider_for_agent(agent)
+        if provider is None:
             return None
-
-        pricing = get_pricing(model)
-        return pricing.context_window if pricing else None
+        candidates: list[str] = []
+        if output is not None and output.model:
+            candidates.append(output.model)
+        if agent.model and agent.model not in candidates:
+            candidates.append(agent.model)
+        default = self.config.workflow.runtime.default_model
+        if default and default not in candidates:
+            candidates.append(default)
+        for model in candidates:
+            try:
+                value = await provider.get_max_prompt_tokens(model)
+            except Exception as e:
+                logger.debug(
+                    "get_max_prompt_tokens(%r) raised on provider for agent %s: %s",
+                    model,
+                    agent.name,
+                    e,
+                )
+                continue
+            if value is not None:
+                return value
+        return None
 
     async def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the workflow from entry_point to $end.
@@ -1520,7 +1568,9 @@ class WorkflowEngine:
                                 "agent_name": agent.name,
                                 "iteration": agent_execution_count,
                                 "agent_type": agent.type or "agent",
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent
+                                ),
                             },
                         )
 
@@ -1844,7 +1894,9 @@ class WorkflowEngine:
                                 "output": output.content,
                                 "output_keys": output_keys,
                                 "context_window_used": output.input_tokens,
-                                "context_window_max": self._get_context_window_for_agent(agent),
+                                "context_window_max": await self._get_context_window_for_agent(
+                                    agent, output
+                                ),
                             },
                         )
 
@@ -2472,7 +2524,9 @@ class WorkflowEngine:
                         "tokens": output.tokens_used,
                         "cost_usd": usage.cost_usd,
                         "context_window_used": output.input_tokens,
-                        "context_window_max": self._get_context_window_for_agent(agent),
+                        "context_window_max": await self._get_context_window_for_agent(
+                            agent, output
+                        ),
                     },
                 )
 

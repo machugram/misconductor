@@ -695,3 +695,95 @@ class TestFixPipeBlockingMode:
         # early — it proceeded past the guard and attempted the import.
         with contextlib.suppress(ModuleNotFoundError):
             provider._fix_pipe_blocking_mode()
+
+
+class TestGetMaxPromptTokens:
+    """Tests for CopilotProvider.get_max_prompt_tokens."""
+
+    @staticmethod
+    def _make_model(model_id: str, max_prompt_tokens: int) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=model_id,
+            capabilities=SimpleNamespace(
+                limits=SimpleNamespace(max_prompt_tokens=max_prompt_tokens)
+            ),
+        )
+
+    @staticmethod
+    def _provider_with_list_models(list_models_impl: Any) -> CopilotProvider:
+        """Build a provider with the SDK short-circuit disabled and a fake client.
+
+        Uses ``stub_handler`` for ``mock_handler`` to satisfy the constructor,
+        then nulls ``_mock_handler`` so ``get_max_prompt_tokens`` falls through
+        to the SDK path. ``_started=True`` skips ``_ensure_client_started``.
+        """
+        from types import SimpleNamespace
+
+        provider = CopilotProvider(mock_handler=stub_handler)
+        provider._mock_handler = None
+        provider._client = SimpleNamespace(list_models=list_models_impl)
+        provider._started = True
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_mock_handler_mode_returns_none(self) -> None:
+        """Mock-handler mode has no SDK to query — must return None."""
+        provider = CopilotProvider(mock_handler=stub_handler)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+
+    @pytest.mark.asyncio
+    async def test_returns_max_prompt_tokens_for_known_model(self) -> None:
+        async def list_models() -> list[Any]:
+            return [self._make_model("gpt-4o", 128000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("gpt-4o") == 128000
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_unknown_model(self) -> None:
+        async def list_models() -> list[Any]:
+            return []
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_oserror_returns_none_and_does_not_cache(self) -> None:
+        """A transport-level error is swallowed; the next call retries."""
+        calls = 0
+
+        async def list_models() -> list[Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("network down")
+            return [self._make_model("gpt-4o", 128000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("gpt-4o") is None
+        assert await provider.get_max_prompt_tokens("gpt-4o") == 128000
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_propagates(self) -> None:
+        """Non-SDK exceptions (programming errors) are not swallowed by the
+        provider — they bubble up so the engine's outer safety net handles them."""
+
+        async def list_models() -> list[Any]:
+            raise ValueError("bug")
+
+        provider = self._provider_with_list_models(list_models)
+        with pytest.raises(ValueError):
+            await provider.get_max_prompt_tokens("gpt-4o")
+
+    @pytest.mark.asyncio
+    async def test_alias_resolves_via_match_model_id(self) -> None:
+        """Versioned-suffix aliases resolve to the SDK's listed ID."""
+
+        async def list_models() -> list[Any]:
+            return [self._make_model("claude-3-5-sonnet", 200_000)]
+
+        provider = self._provider_with_list_models(list_models)
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-latest") == 200_000
+        assert await provider.get_max_prompt_tokens("claude-3-5-sonnet-20241022") == 200_000
