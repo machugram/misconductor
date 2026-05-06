@@ -40,6 +40,7 @@ from conductor.gates.human import (
     GateResult,
     HumanGateHandler,
     MaxIterationsHandler,
+    MaxIterationsPromptResult,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
 from conductor.providers.base import AgentOutput
@@ -2442,20 +2443,63 @@ class WorkflowEngine:
 
         Raises:
             MaxIterationsError: If limit exceeded and user chooses not to continue.
+
+        Emits:
+            ``iteration_limit_reached`` before the gate, and
+            ``iteration_limit_resolved`` after — even when the prompt raises an
+            unexpected exception (with ``aborted=True``). See issue #134.
         """
         try:
             self.limits.check_iteration(agent_name)
         except MaxIterationsError:
-            # Prompt user for more iterations
-            await self._suspend_listener()
+            # Surface the gate to subscribers (web dashboard, JSONL log) before
+            # blocking on the console prompt — otherwise the workflow appears
+            # silently stalled when monitored via --web. See issue #134.
+            recent_history = self.limits.execution_history[-5:]
+            self._emit(
+                "iteration_limit_reached",
+                {
+                    "agent_name": agent_name,
+                    "current_iteration": self.limits.current_iteration,
+                    "max_iterations": self.limits.max_iterations,
+                    "agent_history": recent_history,
+                    "possible_loop": len(set(recent_history[-3:])) <= 1
+                    and len(recent_history) >= 3,
+                    "skip_gates": self.max_iterations_handler.skip_gates,
+                },
+            )
+
+            # Wrap resolved emission in an outer finally so the dashboard gate
+            # always closes — even if the prompt itself raises (EOFError on
+            # non-TTY, KeyboardInterrupt race, asyncio.CancelledError, etc.).
+            # Without this guarantee, the original #134 symptom recurs on the
+            # error path.
+            result: MaxIterationsPromptResult | None = None
             try:
-                result = await self.max_iterations_handler.handle_limit_reached(
-                    current_iteration=self.limits.current_iteration,
-                    max_iterations=self.limits.max_iterations,
-                    agent_history=self.limits.execution_history,
-                )
+                await self._suspend_listener()
+                try:
+                    result = await self.max_iterations_handler.handle_limit_reached(
+                        current_iteration=self.limits.current_iteration,
+                        max_iterations=self.limits.max_iterations,
+                        agent_history=self.limits.execution_history,
+                    )
+                finally:
+                    await self._resume_listener()
             finally:
-                await self._resume_listener()
+                self._emit(
+                    "iteration_limit_resolved",
+                    {
+                        "agent_name": agent_name,
+                        "continue_execution": (
+                            result.continue_execution if result is not None else False
+                        ),
+                        "additional_iterations": (
+                            result.additional_iterations if result is not None else 0
+                        ),
+                        "aborted": result is None,
+                    },
+                )
+
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
@@ -2477,20 +2521,62 @@ class WorkflowEngine:
 
         Raises:
             MaxIterationsError: If limit exceeded and user chooses not to continue.
+
+        Emits:
+            ``iteration_limit_reached`` before the gate, and
+            ``iteration_limit_resolved`` after — even when the prompt raises an
+            unexpected exception (with ``aborted=True``). See issue #134.
         """
         try:
             self.limits.check_parallel_group_iteration(group_name, agent_count)
         except MaxIterationsError:
-            # Prompt user for more iterations
-            await self._suspend_listener()
+            # See _check_iteration_with_prompt — same dashboard-visibility fix
+            # for parallel groups (issue #134). Note: agent_history here is
+            # the cross-group execution list, so the possible_loop heuristic
+            # may surface false positives for true parallel patterns.
+            recent_history = self.limits.execution_history[-5:]
+            self._emit(
+                "iteration_limit_reached",
+                {
+                    "group_name": group_name,
+                    "agent_count": agent_count,
+                    "current_iteration": self.limits.current_iteration,
+                    "max_iterations": self.limits.max_iterations,
+                    "agent_history": recent_history,
+                    "possible_loop": len(set(recent_history[-3:])) <= 1
+                    and len(recent_history) >= 3,
+                    "skip_gates": self.max_iterations_handler.skip_gates,
+                },
+            )
+
+            # Wrap resolved emission in an outer finally so the dashboard gate
+            # always closes — see _check_iteration_with_prompt for the rationale.
+            result: MaxIterationsPromptResult | None = None
             try:
-                result = await self.max_iterations_handler.handle_limit_reached(
-                    current_iteration=self.limits.current_iteration,
-                    max_iterations=self.limits.max_iterations,
-                    agent_history=self.limits.execution_history,
-                )
+                await self._suspend_listener()
+                try:
+                    result = await self.max_iterations_handler.handle_limit_reached(
+                        current_iteration=self.limits.current_iteration,
+                        max_iterations=self.limits.max_iterations,
+                        agent_history=self.limits.execution_history,
+                    )
+                finally:
+                    await self._resume_listener()
             finally:
-                await self._resume_listener()
+                self._emit(
+                    "iteration_limit_resolved",
+                    {
+                        "group_name": group_name,
+                        "continue_execution": (
+                            result.continue_execution if result is not None else False
+                        ),
+                        "additional_iterations": (
+                            result.additional_iterations if result is not None else 0
+                        ),
+                        "aborted": result is None,
+                    },
+                )
+
             if result.continue_execution:
                 self.limits.increase_limit(result.additional_iterations)
                 # Re-check should now pass
