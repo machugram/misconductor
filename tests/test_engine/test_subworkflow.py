@@ -1468,3 +1468,396 @@ class TestSubWorkflowDashboardPath:
             ("batch[1]",),
             ("batch[2]",),
         }
+
+
+class TestRegistrySubWorkflowResolution:
+    """Tests for _resolve_subworkflow_path with registry references."""
+
+    @pytest.mark.asyncio
+    async def test_registry_ref_resolved_and_executed(
+        self, tmp_workflow_dir: Path, tmp_path: Path
+    ) -> None:
+        """Registry reference fetches workflow and executes it.
+
+        Mocks only ``fetch_workflow`` so that the engine's real
+        ``_resolve_subworkflow_path`` runs end-to-end: real ``resolve_ref``
+        parses the ``analysis@team-a#v1.0.0`` syntax, real precedence check
+        confirms no local file shadows it, and the registry branch is taken.
+        """
+        from unittest.mock import patch
+
+        # Write a real cached sub-workflow to a temp location
+        cached_sub = tmp_path / "sub.yaml"
+        _write_yaml(
+            cached_sub,
+            """\
+            workflow:
+              name: sub-from-registry
+              entry_point: inner
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: inner
+                type: agent
+                prompt: do it
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ inner.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="analysis@team-a#v1.0.0",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        # Set up a real registry config so resolve_ref can find "team-a"
+        from conductor.registry.config import RegistriesConfig, RegistryEntry, RegistryType
+
+        registry_config = RegistriesConfig(
+            registries={
+                "team-a": RegistryEntry(
+                    type=RegistryType.github,
+                    source="https://github.com/example/team-a",
+                ),
+            },
+        )
+
+        def mock_handler(agent, prompt, context):
+            return {"result": "registry-result"}
+
+        from conductor.providers.copilot import CopilotProvider
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+
+        # Patch the registry config loader (used by resolve_ref) and
+        # fetch_workflow (the network boundary). Real resolve_ref parses
+        # the ref string and looks up the registry; real
+        # _resolve_subworkflow_path is exercised end-to-end.
+        with (
+            patch("conductor.registry.resolver.load_config", return_value=registry_config),
+            patch("conductor.registry.cache.fetch_workflow", return_value=cached_sub),
+        ):
+            engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+            result = await engine.run({})
+
+        assert result.get("result") == "registry-result"
+
+    @pytest.mark.asyncio
+    async def test_registry_fetch_failure_raises_execution_error(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """Registry fetch failure is wrapped in ExecutionError with agent context."""
+        from unittest.mock import patch
+
+        from conductor.exceptions import ExecutionError
+        from conductor.registry.errors import RegistryError
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="missing@unknown-registry#v1.0.0",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        # Patch resolve_ref to return a registry kind, then patch fetch_workflow to fail
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.resolver import ResolvedRef
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="missing",
+            registry_name="unknown-registry",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch(
+                "conductor.registry.cache.fetch_workflow",
+                side_effect=RegistryError("not found"),
+            ),
+            pytest.raises(ExecutionError, match="Failed to fetch registry sub-workflow"),
+        ):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_local_file_takes_precedence_over_registry(self, tmp_workflow_dir: Path) -> None:
+        """An extensionless name that matches a local file is not treated as registry ref."""
+        # Create a local file named "analysis" (no extension) beside the parent
+        analysis_path = tmp_workflow_dir / "analysis"
+        _write_yaml(
+            analysis_path,
+            """\
+            workflow:
+              name: analysis
+              entry_point: step
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: step
+                type: agent
+                prompt: analyze
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ step.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="analysis",  # extensionless — local file wins
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        from conductor.providers.copilot import CopilotProvider
+
+        provider = CopilotProvider(mock_handler=lambda agent, prompt, context: {"result": "local"})
+
+        # Patch resolve_ref to verify it is NOT called when a local file
+        # exists — the precedence check must short-circuit before parsing.
+        from unittest.mock import patch
+
+        with patch("conductor.registry.resolver.resolve_ref") as mock_resolve_ref:
+            engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+            result = await engine.run({})
+
+        assert result.get("result") == "local"
+        mock_resolve_ref.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_registry_ref_raises_execution_error(
+        self, tmp_workflow_dir: Path
+    ) -> None:
+        """Malformed registry ref raises ExecutionError with helpful message."""
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="sub_wf",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="a@b@c",  # two '@' signs — malformed
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+        )
+
+        mock_provider = MagicMock()
+        engine = WorkflowEngine(config, mock_provider, workflow_path=parent_path)
+
+        with pytest.raises(ExecutionError, match="Failed to resolve sub-workflow"):
+            await engine.run({})
+
+    @pytest.mark.asyncio
+    async def test_resume_re_resolves_registry_ref_to_same_path(
+        self, tmp_workflow_dir: Path, tmp_path: Path
+    ) -> None:
+        """On resume, a registry sub-workflow ref is re-resolved cleanly.
+
+        Verifies the documented compatibility behavior: ``_resolve_subworkflow_path``
+        is called again during ``engine.resume()``, and for a SHA-pinned (or cached)
+        registry ref, ``fetch_workflow`` returns the same local cached path it
+        returned on the original run. This is the determinism guarantee for resume.
+        """
+        from unittest.mock import patch
+
+        from conductor.engine.checkpoint import CheckpointManager
+        from conductor.engine.context import WorkflowContext
+        from conductor.engine.limits import LimitEnforcer
+        from conductor.exceptions import ProviderError
+        from conductor.providers.copilot import CopilotProvider
+        from conductor.registry.config import RegistryEntry, RegistryType
+        from conductor.registry.resolver import ResolvedRef
+
+        # Set up a real cached sub-workflow file
+        cached_sub = tmp_path / "cache" / "team-a" / "analysis" / "abcdef123456" / "analysis.yaml"
+        cached_sub.parent.mkdir(parents=True)
+        _write_yaml(
+            cached_sub,
+            """\
+            workflow:
+              name: analysis
+              entry_point: do_work
+              runtime:
+                provider: copilot
+              limits:
+                max_iterations: 10
+            agents:
+              - name: do_work
+                type: agent
+                prompt: analyze
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ do_work.output.result }}"
+            """,
+        )
+
+        parent_path = tmp_workflow_dir / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="planner",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="planner",
+                    type="agent",
+                    prompt="plan",
+                    routes=[RouteDef(to="sub_wf")],
+                ),
+                AgentDef(
+                    name="sub_wf",
+                    type="workflow",
+                    workflow="analysis@team-a#v1.0.0",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={"result": "{{ sub_wf.output.result }}"},
+        )
+
+        # Track fetch_workflow calls and the paths returned on each call
+        fetch_call_paths: list[Path] = []
+
+        def tracked_fetch(*args, **kwargs):
+            fetch_call_paths.append(cached_sub)
+            return cached_sub
+
+        fake_entry = RegistryEntry(type=RegistryType.github, source="https://github.com/x/y")
+        fake_resolved = ResolvedRef(
+            kind="registry",
+            workflow="analysis",
+            registry_name="team-a",
+            ref="v1.0.0",
+            registry_entry=fake_entry,
+        )
+
+        # First run: planner succeeds, sub_wf inner agent fails
+        run_count = {"do_work": 0}
+
+        def failing_handler(agent, prompt, context):
+            if agent.name == "planner":
+                return {"plan": "do analysis"}
+            if agent.name == "do_work":
+                run_count["do_work"] += 1
+                if run_count["do_work"] == 1:
+                    raise ProviderError("transient failure")
+                return {"result": "analysis-complete"}
+            return {}
+
+        provider = CopilotProvider(mock_handler=failing_handler)
+        engine = WorkflowEngine(config, provider, workflow_path=parent_path)
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch("conductor.registry.cache.fetch_workflow", side_effect=tracked_fetch),
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+            pytest.raises(ProviderError, match="transient failure"),
+        ):
+            await engine.run({})
+
+        # Sub-workflow was reached (fetch was called) but inner agent failed
+        assert len(fetch_call_paths) == 1, "fetch_workflow should have been called once"
+        first_path = fetch_call_paths[0]
+
+        checkpoint_path = engine._last_checkpoint_path
+        assert checkpoint_path is not None
+
+        # Resume: re-create engine, restore state, run again
+        cp = CheckpointManager.load_checkpoint(checkpoint_path)
+        engine2 = WorkflowEngine(config, provider, workflow_path=parent_path)
+        engine2.set_context(WorkflowContext.from_dict(cp.context))
+        engine2.set_limits(
+            LimitEnforcer.from_dict(
+                cp.limits,
+                timeout_seconds=config.workflow.limits.timeout_seconds,
+            )
+        )
+
+        with (
+            patch("conductor.registry.resolver.resolve_ref", return_value=fake_resolved),
+            patch("conductor.registry.cache.fetch_workflow", side_effect=tracked_fetch),
+            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+        ):
+            result = await engine2.resume(cp.current_agent)
+
+        # fetch_workflow was called again on resume — and returned the SAME
+        # cached path. This is the deterministic-resume guarantee for cached
+        # registry refs.
+        assert len(fetch_call_paths) == 2, "fetch_workflow should be called again on resume"
+        assert fetch_call_paths[1] == first_path, (
+            "resume must resolve the registry ref to the same cached path as the original run"
+        )
+        assert result["result"] == "analysis-complete"
