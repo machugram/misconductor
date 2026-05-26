@@ -20,6 +20,9 @@ export type EventType =
   | 'script_started'
   | 'script_completed'
   | 'script_failed'
+  | 'set_started'
+  | 'set_completed'
+  | 'set_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'route_taken'
@@ -151,6 +154,42 @@ export interface ScriptCompletedData {
 }
 
 export interface ScriptFailedData {
+  agent_name: string;
+  elapsed?: number;
+  error_type?: string;
+  message?: string;
+}
+
+// --- Set step lifecycle (issue #221) ---
+
+/** Effective output-type label used during coercion. Mirrors the schema's
+ * `AgentDef.output_type` enumeration and `SetOutputType` in set_step.py. */
+export type SetOutputType =
+  | 'auto'
+  | 'string'
+  | 'number'
+  | 'integer'
+  | 'boolean'
+  | 'list'
+  | 'dict';
+
+export interface SetStartedData {
+  agent_name: string;
+  iteration?: number;
+}
+
+export interface SetCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  /** Effective output type used for coercion. */
+  output_type?: SetOutputType;
+  /** Sorted dict keys for multi-`values:` steps; empty array for scalars. */
+  output_keys?: string[];
+  /** Short JSON-safe preview of the bound value (truncated to ~512 chars). */
+  value_repr?: string;
+}
+
+export interface SetFailedData {
   agent_name: string;
   elapsed?: number;
   error_type?: string;
