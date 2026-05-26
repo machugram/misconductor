@@ -17,6 +17,7 @@ from conductor.config.schema import (
     AgentDef,
     ContextConfig,
     GateOption,
+    HooksConfig,
     InputDef,
     LimitsConfig,
     OutputField,
@@ -2727,3 +2728,620 @@ class TestExecuteLoopExceptionArms:
         system = started[0].data["system"]
         assert "bg_stderr_log" not in system
         assert "bg_stdout_log" not in system
+
+
+class TestWorkflowEngineTerminate:
+    """Engine-level tests for ``type: terminate`` steps (issue #219).
+
+    These tests drive the engine through real terminate dispatch (success and
+    failure), verify the correct event payloads, and confirm
+    ``WorkflowTerminated`` semantics: explicit termination must surface as a
+    non-resumable failure with rich metadata, distinguishable from a generic
+    exception. Tests use a stub provider via ``CopilotProvider(mock_handler=…)``
+    only for the upstream agent; the terminate dispatch branch needs no
+    provider call.
+    """
+
+    @staticmethod
+    def _config_with_terminate(
+        status: str,
+        *,
+        output_template: dict[str, str] | None = None,
+        reason: str = "Document already up to date; no edits needed.",
+        also_workflow_output: bool = True,
+    ) -> WorkflowConfig:
+        """Build a small workflow whose entry agent unconditionally routes to a terminate step.
+
+        The entry agent is a real provider-backed agent so the dispatch path
+        exercises every event the dashboard listens for (agent_started /
+        agent_completed) before reaching the terminate branch.
+        """
+        agents: list[AgentDef] = [
+            AgentDef(
+                name="upstream",
+                model="gpt-4",
+                prompt="x",
+                output={"value": OutputField(type="string")},
+                routes=[RouteDef(to="finish")],
+            ),
+            AgentDef(
+                name="finish",
+                type="terminate",
+                status=status,  # type: ignore[arg-type]
+                reason=reason,
+                output_template=output_template,
+            ),
+        ]
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="terminate-test",
+                entry_point="upstream",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=agents,
+            output={"result": "{{ upstream.output.value }}"} if also_workflow_output else {},
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_terminate_returns_output_template(self) -> None:
+        """`status: success` returns the rendered output_template cleanly.
+
+        The workflow-level ``output:`` mapping is REPLACED by the terminate
+        step's ``output_template`` (not merged). This contract lets callers
+        use a terminate step as an early-exit short-circuit that emits a
+        differently-shaped final payload from the normal `$end` path.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        config = self._config_with_terminate(
+            "success",
+            output_template={
+                "result": "no-op",
+                "reason": "{{ finish.output.reason }}",
+            },
+        )
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "upstream-value"})
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        result = await engine.run({})
+
+        assert result == {
+            "result": "no-op",
+            "reason": "Document already up to date; no edits needed.",
+        }
+        completed = [e for e in events if e.type == "workflow_completed"]
+        assert len(completed) == 1
+        data = completed[0].data
+        assert data["is_explicit"] is True
+        assert data["termination_reason"] == "Document already up to date; no edits needed."
+        assert data["terminated_by"] == "finish"
+        assert data["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_success_terminate_without_output_template_falls_back(self) -> None:
+        """Without ``output_template`` the workflow-level ``output:`` is rendered.
+
+        This is the behaviour-preserving default: existing workflows that route
+        to a terminate step without supplying ``output_template`` still produce
+        the same final-output shape as a normal `$end` path.
+        """
+        config = self._config_with_terminate("success", output_template=None)
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "v"})
+
+        engine = WorkflowEngine(config, provider)
+        result = await engine.run({})
+
+        assert result == {"result": "v"}
+
+    @pytest.mark.asyncio
+    async def test_failed_terminate_raises_workflow_terminated(self) -> None:
+        """`status: failed` raises ``WorkflowTerminated`` with structured fields.
+
+        The CLI / dashboard rely on these attributes (``output``, ``reason``,
+        ``terminated_by``) to render the explicit termination distinctly from a
+        generic exception. The reason is the *rendered* string, not the
+        template.
+        """
+        from conductor.exceptions import WorkflowTerminated
+
+        config = self._config_with_terminate(
+            "failed",
+            reason="upstream said {{ upstream.output.value }}",
+            output_template={"aborted": "true", "msg": "{{ upstream.output.value }}"},
+        )
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "stop now"})
+
+        engine = WorkflowEngine(config, provider)
+        with pytest.raises(WorkflowTerminated) as excinfo:
+            await engine.run({})
+
+        err = excinfo.value
+        assert err.terminated_by == "finish"
+        assert err.reason == "upstream said stop now"
+        assert err.output == {"aborted": True, "msg": "stop now"}
+        assert err.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_failed_terminate_emits_workflow_failed_with_explicit_flag(self) -> None:
+        """`status: failed` emits a `workflow_failed` event with `is_explicit: true`.
+
+        Downstream tooling (CI, notifications, dashboards) distinguishes an
+        intentional termination from a generic crash by reading this flag.
+        Without it, every terminate would look indistinguishable from an
+        unhandled exception.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+        from conductor.exceptions import WorkflowTerminated
+
+        config = self._config_with_terminate("failed", reason="halt")
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "v"})
+
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        with pytest.raises(WorkflowTerminated):
+            await engine.run({})
+
+        failed = [e for e in events if e.type == "workflow_failed"]
+        assert len(failed) == 1
+        data = failed[0].data
+        assert data["is_explicit"] is True
+        assert data["error_type"] == "WorkflowTerminated"
+        assert data["terminated_by"] == "finish"
+        assert data["termination_reason"] == "halt"
+        assert data["status"] == "failed"
+        # The agent-lifecycle event for a failed terminate is `agent_failed`
+        # (not `agent_completed`) so dashboard counters stay accurate.
+        agent_lifecycle = [e for e in events if e.type in ("agent_completed", "agent_failed")]
+        terminate_lifecycle = [e for e in agent_lifecycle if e.data.get("agent_name") == "finish"]
+        assert terminate_lifecycle and terminate_lifecycle[0].type == "agent_failed", (
+            f"terminate with status=failed must emit agent_failed; "
+            f"got: {[e.type for e in terminate_lifecycle]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_terminate_does_not_save_checkpoint(self, tmp_path) -> None:
+        """Explicit termination is intentional; no on-failure checkpoint is saved.
+
+        Without this carve-out, every terminate-failed run would leave a
+        checkpoint behind for the next ``conductor resume`` to pick up — but
+        terminating with `status: failed` is the author saying "this run is
+        complete and the outcome is failure," not "please resume this later."
+        """
+        from conductor.exceptions import WorkflowTerminated
+
+        config = self._config_with_terminate("failed", reason="halt")
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "v"})
+
+        wf_file = tmp_path / "wf.yaml"
+        wf_file.write_text("name: t\n")
+        engine = WorkflowEngine(config, provider, workflow_path=wf_file)
+
+        with pytest.raises(WorkflowTerminated):
+            await engine.run({})
+
+        # No checkpoint files should exist for this workflow run.
+        from conductor.engine.checkpoint import CheckpointManager
+
+        checkpoints = CheckpointManager.list_checkpoints(workflow_path=wf_file)
+        assert not checkpoints, f"failed-terminate must not save a checkpoint; got: {checkpoints!r}"
+
+    @pytest.mark.asyncio
+    async def test_terminate_step_stored_in_context(self) -> None:
+        """The terminate step records its own context entry before output renders.
+
+        Order matters: workflow-level ``output:`` templates can reference
+        ``{{ <terminate>.reason }}`` only if the entry is stored BEFORE the
+        final output is rendered.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="upstream",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="upstream",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"value": OutputField(type="string")},
+                    routes=[RouteDef(to="finish")],
+                ),
+                AgentDef(
+                    name="finish",
+                    type="terminate",
+                    status="success",
+                    reason="all done",
+                ),
+            ],
+            # Reference the terminate step's stored entry from workflow.output
+            # to assert ordering.
+            output={
+                "reason": "{{ finish.output.reason }}",
+                "by": "{{ finish.output.terminated_by }}",
+            },
+        )
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "v"})
+
+        engine = WorkflowEngine(config, provider)
+        result = await engine.run({})
+
+        assert result == {"reason": "all done", "by": "finish"}
+
+    @pytest.mark.asyncio
+    async def test_reason_rendered_against_context(self) -> None:
+        """``reason`` is a Jinja2 template; refs resolve against accumulated context."""
+        from conductor.exceptions import WorkflowTerminated
+
+        config = self._config_with_terminate(
+            "failed",
+            reason="value was {{ upstream.output.value }}",
+        )
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "unsafe-input"})
+        engine = WorkflowEngine(config, provider)
+        with pytest.raises(WorkflowTerminated) as excinfo:
+            await engine.run({})
+        assert excinfo.value.reason == "value was unsafe-input"
+
+    @pytest.mark.asyncio
+    async def test_terminate_with_input_declared(self) -> None:
+        """A terminate step may declare ``input:`` refs for template rendering.
+
+        Mirrors the contract for other step types: declaring an input forces
+        the engine to materialize that ref in the agent's context.
+        """
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="t",
+                entry_point="upstream",
+                runtime=RuntimeConfig(provider="copilot"),
+                # explicit mode requires inputs to be declared
+                context=ContextConfig(mode="explicit"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="upstream",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"value": OutputField(type="string")},
+                    routes=[RouteDef(to="finish")],
+                ),
+                AgentDef(
+                    name="finish",
+                    type="terminate",
+                    status="success",
+                    reason="ok",
+                    input=["upstream.output"],
+                    output_template={"echo": "{{ upstream.output.value }}"},
+                ),
+            ],
+        )
+        provider = CopilotProvider(mock_handler=lambda *_a, **_kw: {"value": "VAL"})
+        engine = WorkflowEngine(config, provider)
+        result = await engine.run({})
+        assert result == {"echo": "VAL"}
+
+
+class TestWorkflowEngineTerminateAdditionalScenarios:
+    """Additional terminate-step engine coverage (issue #219).
+
+    The base class above covers single-agent → terminate sequences. These
+    tests exercise the corners surfaced during PR review:
+
+    - Terminate as the workflow entry point (the dispatch path runs without
+      any upstream context).
+    - Terminate as a route target from a parallel group's routes and from a
+      for_each group's routes (the main routing loop must dispatch to the
+      terminate branch after the group completes).
+    - Lifecycle hooks (``on_complete`` for success, ``on_error`` for failed)
+      fire with the right arguments.
+    """
+
+    @pytest.mark.asyncio
+    async def test_terminate_as_entry_point(self) -> None:
+        """Workflow whose `entry_point` IS a terminate step ends immediately.
+
+        Schema validation allows this; this test pins the engine actually
+        dispatches it correctly when there is no upstream agent context to
+        accumulate before the terminate branch runs.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="entry-terminate",
+                entry_point="bye",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=5),
+            ),
+            agents=[
+                AgentDef(
+                    name="bye",
+                    type="terminate",
+                    status="success",
+                    reason="nothing to do",
+                    output_template={"result": "no-op"},
+                ),
+            ],
+            output={},
+        )
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(config, CopilotProvider(), event_emitter=emitter)
+
+        result = await engine.run({})
+
+        assert result == {"result": "no-op"}
+        completed = [e for e in events if e.type == "workflow_completed"]
+        assert len(completed) == 1
+        assert completed[0].data["terminated_by"] == "bye"
+
+    @pytest.mark.asyncio
+    async def test_terminate_routed_from_parallel_group(self) -> None:
+        """A parallel-group route may target a terminate step.
+
+        The main routing loop dispatches the terminate step after the group
+        completes; without this coverage a refactor of the parallel-group
+        post-execution dispatch could silently break that hop.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="par-terminate",
+                entry_point="group",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="a",
+                    model="gpt-4",
+                    prompt="a",
+                    output={"x": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="b",
+                    model="gpt-4",
+                    prompt="b",
+                    output={"y": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="finish",
+                    type="terminate",
+                    status="success",
+                    reason="parallel branches done",
+                    output_template={"result": "from-parallel"},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="group",
+                    agents=["a", "b"],
+                    routes=[RouteDef(to="finish")],
+                ),
+            ],
+            output={},
+        )
+
+        provider = CopilotProvider(
+            mock_handler=lambda agent, *_a, **_kw: {"x": "ax"} if agent.name == "a" else {"y": "by"}
+        )
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+
+        engine = WorkflowEngine(config, provider, event_emitter=emitter)
+        result = await engine.run({})
+
+        assert result == {"result": "from-parallel"}
+        # Verify the dispatch hop: a `route_taken` event must show
+        # group → finish, and the terminate completion must follow.
+        route_events = [
+            e for e in events if e.type == "route_taken" and e.data.get("from_agent") == "group"
+        ]
+        assert route_events, f"expected route_taken from group; got {[e.type for e in events]}"
+        assert route_events[0].data["to_agent"] == "finish"
+
+    @pytest.mark.asyncio
+    async def test_terminate_routed_from_for_each_group(self) -> None:
+        """A for_each-group route may target a terminate step."""
+        from conductor.config.schema import ForEachDef
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="fe-terminate",
+                entry_point="finder",
+                input={"items": InputDef(type="array", default=["a", "b"])},
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=20),
+            ),
+            agents=[
+                AgentDef(
+                    name="finder",
+                    model="gpt-4",
+                    prompt="x",
+                    output={"items": OutputField(type="array")},
+                    routes=[RouteDef(to="loop")],
+                ),
+                AgentDef(
+                    name="finish",
+                    type="terminate",
+                    status="success",
+                    reason="for_each done",
+                    output_template={"result": "from-for-each"},
+                ),
+            ],
+            for_each=[
+                ForEachDef.model_validate(
+                    {
+                        "name": "loop",
+                        "type": "for_each",
+                        "source": "finder.output.items",
+                        "as": "item",
+                        "agent": AgentDef(
+                            name="worker",
+                            model="gpt-4",
+                            prompt="process {{ item }}",
+                            output={"r": OutputField(type="string")},
+                        ),
+                        "routes": [RouteDef(to="finish")],
+                    }
+                ),
+            ],
+            output={},
+        )
+
+        def mock_handler(agent, *_a, **_kw):
+            if agent.name == "finder":
+                return {"items": ["a", "b"]}
+            return {"r": "ok"}
+
+        provider = CopilotProvider(mock_handler=mock_handler)
+        engine = WorkflowEngine(config, provider)
+        result = await engine.run({})
+        assert result == {"result": "from-for-each"}
+
+    @pytest.mark.asyncio
+    async def test_on_complete_hook_fires_for_success_terminate(self) -> None:
+        """`on_complete` hook must fire when a terminate step ends with success.
+
+        Hooks are a public extension point; a refactor that dropped the
+        `_execute_hook("on_complete", ...)` call from the success-terminate
+        branch would silently regress every workflow that relies on the
+        hook for completion notifications.
+        """
+        from unittest.mock import patch as _patch
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="hook-success",
+                entry_point="bye",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=5),
+                hooks=HooksConfig(on_complete="completed: {{ result }}"),
+            ),
+            agents=[
+                AgentDef(
+                    name="bye",
+                    type="terminate",
+                    status="success",
+                    reason="all done",
+                    output_template={"r": "ok"},
+                ),
+            ],
+            output={},
+        )
+        engine = WorkflowEngine(config, CopilotProvider())
+        with _patch.object(engine, "_execute_hook", wraps=engine._execute_hook) as spy:
+            result = await engine.run({})
+        assert result == {"r": "ok"}
+        completion_calls = [
+            call for call in spy.call_args_list if call.args and call.args[0] == "on_complete"
+        ]
+        assert len(completion_calls) == 1, (
+            f"on_complete must fire exactly once; got: {spy.call_args_list}"
+        )
+        # The hook must receive the rendered output dict, not a raw template.
+        assert completion_calls[0].kwargs.get("result") == {"r": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_on_error_hook_fires_for_failed_terminate(self) -> None:
+        """`on_error` hook must fire when a terminate step ends with failed.
+
+        The hook receives the `WorkflowTerminated` exception so authors can
+        notify on the structured `reason`/`terminated_by` rather than a
+        generic error message.
+        """
+        from unittest.mock import patch as _patch
+
+        from conductor.exceptions import WorkflowTerminated
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="hook-error",
+                entry_point="abort",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=5),
+                hooks=HooksConfig(on_error="failed: {{ error.message }}"),
+            ),
+            agents=[
+                AgentDef(
+                    name="abort",
+                    type="terminate",
+                    status="failed",
+                    reason="halt",
+                ),
+            ],
+            output={},
+        )
+        engine = WorkflowEngine(config, CopilotProvider())
+        with (
+            _patch.object(engine, "_execute_hook", wraps=engine._execute_hook) as spy,
+            pytest.raises(WorkflowTerminated),
+        ):
+            await engine.run({})
+        error_calls = [
+            call for call in spy.call_args_list if call.args and call.args[0] == "on_error"
+        ]
+        assert len(error_calls) == 1, f"on_error must fire exactly once; got: {spy.call_args_list}"
+        passed_error = error_calls[0].kwargs.get("error")
+        assert isinstance(passed_error, WorkflowTerminated)
+        assert passed_error.reason == "halt"
+        assert passed_error.terminated_by == "abort"
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_event_ordering_failed_terminate(self) -> None:
+        """`agent_failed` must fire BEFORE `workflow_failed` for failed terminate.
+
+        The dashboard's failure-counter UI relies on this ordering. Without
+        the ordering assertion, a refactor that reversed the emits (or
+        dropped `agent_failed`) would visually decouple agent and workflow
+        failure states in the dashboard.
+        """
+        from conductor.events import WorkflowEvent, WorkflowEventEmitter
+        from conductor.exceptions import WorkflowTerminated
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="order-test",
+                entry_point="abort",
+                runtime=RuntimeConfig(provider="copilot"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=5),
+            ),
+            agents=[
+                AgentDef(name="abort", type="terminate", status="failed", reason="halt"),
+            ],
+            output={},
+        )
+        events: list[WorkflowEvent] = []
+        emitter = WorkflowEventEmitter()
+        emitter.subscribe(events.append)
+        engine = WorkflowEngine(config, CopilotProvider(), event_emitter=emitter)
+        with pytest.raises(WorkflowTerminated):
+            await engine.run({})
+
+        types_in_order = [e.type for e in events]
+        af_index = types_in_order.index("agent_failed")
+        wf_index = types_in_order.index("workflow_failed")
+        assert af_index < wf_index, (
+            f"agent_failed must precede workflow_failed; got order: {types_in_order}"
+        )
