@@ -505,7 +505,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude"] | None = None
+    provider: Literal["copilot", "claude", "claude-agent-sdk"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -1319,7 +1319,7 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude"] = "copilot"
+    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
