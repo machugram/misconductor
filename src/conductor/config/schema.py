@@ -588,6 +588,28 @@ class AgentDef(BaseModel):
     working_dir: str | None = None
     """Working directory for script subprocess execution."""
 
+    stdin: str | None = None
+    """Payload written to the script subprocess's stdin (script type only).
+
+    A Jinja2 string template rendered against the workflow context and written
+    to the child process's stdin as UTF-8. Use this to hand large structured
+    payloads to scripts without hitting OS command-line length limits (notably
+    Windows's ~32 KB command-line cap):
+
+    - JSON: ``stdin: "{{ upstream.output.evaluations | tojson }}"`` — the
+      built-in ``tojson`` filter emits valid JSON.
+    - Arbitrary text: ``stdin: "{{ diff }}"``.
+
+    Semantics:
+
+    - Omitted (``None``) — the child inherits the parent's stdin (the
+      unchanged legacy behavior).
+    - Present (any string, including ``""``) — stdin is piped; an explicit
+      empty string sends immediate EOF.
+    - Orthogonal to ``args`` — when both are set, ``args`` are still passed on
+      the command line and ``stdin`` is piped.
+    """
+
     timeout: int | None = None
     """Per-script timeout in seconds."""
 
@@ -899,6 +921,19 @@ class AgentDef(BaseModel):
                         f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
                         "(only 'terminate' agents support this field)"
                     )
+
+        # Field exclusive to ``type: script`` — reject if set on any other
+        # type. No per-type branch below inspects ``stdin``, so this single
+        # guard is the sole rejection path for every non-script type. It
+        # mirrors the terminate-exclusive guard above so the message names the
+        # conflict; being a standalone guard (rather than a per-branch check)
+        # it also covers ``agent`` / ``human_gate``, which have no
+        # ``command``/``args`` branch.
+        if self.type != "script" and self.stdin is not None:
+            raise ValueError(
+                f"'{self.type or 'agent'}' agents cannot have 'stdin' "
+                "(only 'script' agents support this field)"
+            )
 
         if self.type == "human_gate":
             if not self.options:
