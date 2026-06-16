@@ -408,6 +408,7 @@ class WebDashboard:
             "workflow_completed",
             "workflow_failed",
             "checkpoint_saved",
+            "checkpoint_save_failed",
         }
     )
 

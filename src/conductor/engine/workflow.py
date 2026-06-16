@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from conductor.duration import parse_duration
-from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
@@ -421,6 +421,19 @@ class WorkflowEngine:
         # Checkpoint tracking
         self._current_agent_name: str | None = None
         self._last_checkpoint_path: Path | None = None
+        # Idempotency flag for handle_dashboard_stop (issue #245). Tracked
+        # separately from _last_checkpoint_path because periodic checkpoints
+        # (issue #244) also set _last_checkpoint_path, so it can no longer
+        # double as "the dashboard-stop handler already ran".
+        self._dashboard_stop_handled: bool = False
+        # Monotonic timestamp of the last periodic checkpoint (issue #244),
+        # used to evaluate the runtime.checkpoint.every_seconds throttle at
+        # step boundaries. None until the first periodic checkpoint is saved.
+        self._last_periodic_checkpoint_time: float | None = None
+        # Count of consecutive failed periodic checkpoint saves, reset on a
+        # successful save. Surfaced in checkpoint_save_failed events so the run
+        # doesn't silently lose its recovery safety net.
+        self._periodic_checkpoint_failures: int = 0
 
         # Sub-workflow depth tracking
         self._subworkflow_depth = _subworkflow_depth
@@ -1622,7 +1635,10 @@ class WorkflowEngine:
         # Execute on_start hook
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_run_periodic_checkpoints()
+        return result
 
     async def resume(self, current_agent_name: str) -> dict[str, Any]:
         """Resume workflow execution from a specific agent.
@@ -1649,7 +1665,10 @@ class WorkflowEngine:
         # Execute on_start hook (signals resume)
         self._execute_hook("on_start")
 
-        return await self._execute_loop(current_agent_name)
+        result = await self._execute_loop(current_agent_name)
+        # Successful completion: this run's periodic checkpoints are now stale.
+        self._cleanup_run_periodic_checkpoints()
+        return result
 
     def set_context(self, context: WorkflowContext) -> None:
         """Replace the engine's workflow context with a restored one.
@@ -1685,31 +1704,46 @@ class WorkflowEngine:
         """
         self.limits = limits
 
-    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
-        """Attempt to save a checkpoint after a failure.
+    def _write_checkpoint(
+        self, error: BaseException | None, trigger: CheckpointTrigger
+    ) -> Path | None:
+        """Serialize the current workflow state to a checkpoint file.
 
-        This method never raises — on failure it logs a warning so the
-        original error is not masked.
+        Shared by the on-failure and periodic checkpoint paths. Collects
+        provider session IDs (for Copilot session resume) and delegates to
+        :meth:`CheckpointManager.save_checkpoint`, which never raises.
 
         Args:
-            error: The exception that triggered the checkpoint save.
+            error: The exception that triggered the save, or ``None`` for a
+                periodic checkpoint.
+            trigger: ``"failure"`` or ``"periodic"``.
+
+        Returns:
+            Path to the saved checkpoint, or ``None`` when no ``workflow_path``
+            is set or saving failed.
         """
         if self.workflow_path is None:
             logger.debug("No workflow_path set; skipping checkpoint save")
-            return
+            return None
 
-        # Collect session IDs from provider if available
+        # Collect session IDs from provider if available. Best-effort: a
+        # provider raising here must not break the (failure or periodic)
+        # checkpoint save, so the "never raises" contract holds for both paths.
         copilot_session_ids: dict[str, str] | None = None
-        provider = self._single_provider
-        if provider is not None and hasattr(provider, "get_session_ids"):
-            copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
-        elif self._registry is not None:
-            for p in self._registry.get_active_providers().values():
-                if hasattr(p, "get_session_ids"):
-                    copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
-                    break
+        try:
+            provider = self._single_provider
+            if provider is not None and hasattr(provider, "get_session_ids"):
+                copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+            elif self._registry is not None:
+                for p in self._registry.get_active_providers().values():
+                    if hasattr(p, "get_session_ids"):
+                        copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                        break
+        except Exception:
+            logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
+            copilot_session_ids = None
 
-        checkpoint_path = CheckpointManager.save_checkpoint(
+        return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
             context=self.context,
             limits=self.limits,
@@ -1721,17 +1755,168 @@ class WorkflowEngine:
             instructions_preamble=self._instructions_preamble,
             run_id=self._run_context.run_id,
             event_log_path=self._run_context.log_file,
+            trigger=trigger,
         )
-        self._last_checkpoint_path = checkpoint_path
+
+    def _save_checkpoint_on_failure(self, error: BaseException) -> None:
+        """Attempt to save a checkpoint after a failure.
+
+        This method never raises — on failure it logs a warning so the
+        original error is not masked.
+
+        Args:
+            error: The exception that triggered the checkpoint save.
+        """
+        checkpoint_path = self._write_checkpoint(error, trigger="failure")
+        # Only overwrite _last_checkpoint_path on a successful save, so a
+        # failed failure-save doesn't discard a still-valid periodic checkpoint
+        # path that resume instructions can point at.
         if checkpoint_path is not None:
+            self._last_checkpoint_path = checkpoint_path
             self._emit(
                 "checkpoint_saved",
                 {
                     "path": str(checkpoint_path),
                     "agent_name": self._current_agent_name,
                     "error_type": type(error).__name__,
+                    "trigger": "failure",
                 },
             )
+
+    @property
+    def _periodic_checkpoints_active(self) -> bool:
+        """True when periodic checkpointing applies: root engine, and opt-in.
+
+        Sub-workflow engines never write periodic checkpoints (their state is
+        re-run from scratch on resume), and the feature is off unless a
+        ``runtime.checkpoint`` trigger is configured.
+        """
+        return self._subworkflow_depth == 0 and self.config.workflow.runtime.checkpoint.is_enabled
+
+    def _periodic_checkpoint_due(self, now: float) -> bool:
+        """Return True if a periodic checkpoint should be saved at *now*.
+
+        ``every_agent`` fires at every boundary; otherwise ``every_seconds`` is
+        a throttle measured from the last periodic save. The first save always
+        fires (``_last_periodic_checkpoint_time`` is ``None``); the interval
+        only throttles subsequent saves. Triggers are OR-combined.
+
+        Args:
+            now: Current ``time.monotonic()`` reading.
+        """
+        cfg = self.config.workflow.runtime.checkpoint
+        if cfg.every_agent:
+            return True
+        if cfg.every_seconds is None:
+            return False
+        last = self._last_periodic_checkpoint_time
+        return last is None or (now - last) >= cfg.every_seconds
+
+    def _maybe_save_periodic_checkpoint(self) -> None:
+        """Save a periodic checkpoint at a step boundary, if configured.
+
+        Called at the top of the execution loop, where all prior step outputs
+        are already committed to ``self.context`` and ``self._current_agent_name``
+        is the step *about to run* — so a resume from this checkpoint re-runs
+        exactly that step with all prior context restored (identical semantics
+        to a failure checkpoint).
+
+        Opt-in via ``runtime.checkpoint`` and **root engine only**: sub-workflow
+        state is not independently resumable (the parent re-runs the child from
+        scratch). The very first boundary of a fresh run is skipped (empty
+        context). Never raises — a failed periodic save must not disrupt the
+        running workflow; it is surfaced via a ``checkpoint_save_failed`` event
+        instead, so a user relying on periodic checkpoints for recovery is not
+        left silently without one. See issue #244.
+        """
+        if not self._periodic_checkpoints_active:
+            return
+        # Skip the first boundary of a fresh run (nothing executed yet). Resume
+        # from a periodic checkpoint enters with current_iteration > 0, so its
+        # first boundary is allowed.
+        if self.limits.current_iteration == 0:
+            return
+
+        now = _time.monotonic()
+        if not self._periodic_checkpoint_due(now):
+            return
+
+        # The whole save (write + emit + rotate) is wrapped so a failure in any
+        # step is contained: a periodic checkpoint must never disrupt the run.
+        try:
+            checkpoint_path = self._write_checkpoint(None, trigger="periodic")
+            if checkpoint_path is None:
+                # save_checkpoint swallowed an error (or no workflow_path) and
+                # returned None — surface it rather than silently continuing.
+                self._record_periodic_checkpoint_failure(None)
+                return
+
+            self._last_checkpoint_path = checkpoint_path
+            self._last_periodic_checkpoint_time = now
+            self._periodic_checkpoint_failures = 0
+            self._emit(
+                "checkpoint_saved",
+                {
+                    "path": str(checkpoint_path),
+                    "agent_name": self._current_agent_name,
+                    "error_type": None,
+                    "trigger": "periodic",
+                },
+            )
+            if self.workflow_path is not None:
+                CheckpointManager.rotate_periodic_checkpoints(
+                    self.workflow_path,
+                    self._run_context.run_id,
+                    self.config.workflow.runtime.checkpoint.keep_last,
+                )
+        except Exception as exc:
+            self._record_periodic_checkpoint_failure(exc)
+
+    def _record_periodic_checkpoint_failure(self, error: Exception | None) -> None:
+        """Record and surface a failed periodic checkpoint save (never raises).
+
+        A failed periodic save is otherwise invisible — the run continues
+        normally — which would silently deprive a recovery-reliant user of the
+        checkpoints they opted into. Emit a structured ``checkpoint_save_failed``
+        event (captured by the JSONL log and the dashboard, and surfaced on the
+        console by the CLI subscriber) carrying a running ``consecutive_failures``
+        count so consumers can escalate.
+
+        Args:
+            error: The exception raised during the save, or ``None`` when the
+                save merely returned no path.
+        """
+        self._periodic_checkpoint_failures += 1
+        logger.warning(
+            "Periodic checkpoint save failed (%d consecutive)",
+            self._periodic_checkpoint_failures,
+            exc_info=error is not None,
+        )
+        self._emit(
+            "checkpoint_save_failed",
+            {
+                "agent_name": self._current_agent_name,
+                "trigger": "periodic",
+                "error_type": type(error).__name__ if error is not None else None,
+                "consecutive_failures": self._periodic_checkpoint_failures,
+            },
+        )
+
+    def _cleanup_run_periodic_checkpoints(self) -> None:
+        """Delete this run's periodic checkpoints at a terminal, non-resumable end.
+
+        Periodic checkpoints are stale recovery points once the run has reached
+        a terminal outcome that should not be resumed: a clean completion, or an
+        explicit ``status: failed`` terminate (documented as non-resumable).
+        Root engine only; best-effort. **Not** called on an unexpected failure,
+        so periodic checkpoints remain alongside the failure checkpoint for
+        diagnosis and resume if the run crashed.
+        """
+        if not self._periodic_checkpoints_active:
+            return
+        if self.workflow_path is None:
+            return
+        CheckpointManager.cleanup_periodic_for_run(self.workflow_path, self._run_context.run_id)
 
     def handle_dashboard_stop(self, message: str) -> Path | None:
         """Give a dashboard-cancelled run the same terminal treatment as an
@@ -1756,13 +1941,14 @@ class WorkflowEngine:
 
         Idempotent: the CLI only calls this when the engine task was genuinely
         *cancelled* (its own terminal ``except`` arms re-raise out of the engine
-        and are handled separately by the wrapper, so in practice this runs with
-        ``_last_checkpoint_path`` still ``None``). The ``_last_checkpoint_path``
-        guard is therefore a defensive backstop against repeat or direct
-        invocation: if a checkpoint was already recorded this run, it is returned
-        without emitting duplicate events. Does not raise on the expected failure
-        paths — ``_save_checkpoint_on_failure``, ``_emit`` (per-subscriber
-        guarded), and ``_execute_hook`` all swallow their own errors.
+        and are handled separately by the wrapper). The ``_dashboard_stop_handled``
+        flag is a defensive backstop against repeat or direct invocation: once
+        this has run, it returns the recorded checkpoint path without emitting
+        duplicate events. (It uses a dedicated flag rather than
+        ``_last_checkpoint_path is not None`` because periodic checkpoints,
+        issue #244, also set ``_last_checkpoint_path``.) Does not raise on the
+        expected failure paths — ``_save_checkpoint_on_failure``, ``_emit`` (per-
+        subscriber guarded), and ``_execute_hook`` all swallow their own errors.
 
         Args:
             message: Human-readable reason for the stop. Used as the failure
@@ -1771,8 +1957,9 @@ class WorkflowEngine:
         Returns:
             Path to the saved checkpoint, or ``None`` if none could be written.
         """
-        if self._last_checkpoint_path is not None:
+        if self._dashboard_stop_handled:
             return self._last_checkpoint_path
+        self._dashboard_stop_handled = True
 
         error = ExecutionError(message)
         # Save first so the single ``workflow_failed`` event below reports the
@@ -2320,6 +2507,12 @@ class WorkflowEngine:
                 while True:
                     self._current_agent_name = current_agent_name
 
+                    # Periodic checkpoint at this step boundary (opt-in,
+                    # root engine only). All prior step outputs are committed
+                    # to context and current_agent_name is the step about to
+                    # run, so a resume re-runs exactly this step. See issue #244.
+                    self._maybe_save_periodic_checkpoint()
+
                     # Try to find agent, parallel group, or for-each group
                     agent = self._find_agent(current_agent_name)
                     parallel_group = self._find_parallel_group(current_agent_name)
@@ -2613,6 +2806,11 @@ class WorkflowEngine:
                                     **termination_meta,
                                 },
                             )
+                            # Explicit failed terminate is intentionally
+                            # non-resumable, so drop this run's periodic
+                            # checkpoints (the raise below bypasses the
+                            # run()/resume() success cleanup).
+                            self._cleanup_run_periodic_checkpoints()
                             raise WorkflowTerminated(
                                 rendered_reason,
                                 output=output,
