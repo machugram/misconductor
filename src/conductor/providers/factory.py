@@ -17,14 +17,18 @@ from conductor.providers.claude_agent_sdk import (
 )
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
+from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
 from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
+ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"]
+
+
 async def create_provider(
-    provider_type: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot",
+    provider_type: ProviderType = "copilot",
     validate: bool = True,
     mcp_servers: dict[str, Any] | None = None,
     default_model: str | None = None,
@@ -107,12 +111,54 @@ async def create_provider(
                     "Claude provider requires anthropic SDK",
                     suggestion="Install with: uv add 'anthropic>=0.77.0,<1.0.0'",
                 )
+            claude_auth_token: str | None = None
+            claude_base_url: str | None = None
+            if provider_settings is not None and provider_settings.name == "claude":
+                if provider_settings.auth_token is not None:
+                    claude_auth_token = provider_settings.auth_token.get_secret_value()
+                claude_base_url = provider_settings.base_url
             provider = ClaudeProvider(
                 model=default_model,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout if timeout is not None else 600.0,
                 mcp_servers=mcp_servers,
+                max_agent_iterations=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
+                default_reasoning_effort=default_reasoning_effort,
+                auth_token=claude_auth_token,
+                base_url=claude_base_url,
+            )
+        case "hermes":
+            if not HERMES_SDK_AVAILABLE:
+                raise ProviderError(
+                    "Hermes provider requires the hermes-agent package",
+                    suggestion="Install with: pip install hermes-agent",
+                )
+            hermes_base_url: str | None = None
+            hermes_api_key: str | None = None
+            hermes_home: str | None = None
+            hermes_toolsets: list[str] | None = None
+            hermes_skip_memory: bool | None = None
+            hermes_skip_context_files: bool | None = None
+            if provider_settings is not None and provider_settings.name == "hermes":
+                hermes_base_url = provider_settings.base_url
+                if provider_settings.api_key is not None:
+                    hermes_api_key = provider_settings.api_key.get_secret_value()
+                hermes_home = provider_settings.hermes_home
+                hermes_toolsets = provider_settings.hermes_toolsets
+                hermes_skip_memory = provider_settings.hermes_skip_memory
+                hermes_skip_context_files = provider_settings.hermes_skip_context_files
+            provider = HermesProvider(
+                model=default_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                base_url=hermes_base_url,
+                api_key=hermes_api_key,
+                hermes_home=hermes_home,
+                hermes_toolsets=hermes_toolsets,
+                skip_memory=hermes_skip_memory,
+                skip_context_files=hermes_skip_context_files,
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
                 default_reasoning_effort=default_reasoning_effort,
@@ -162,7 +208,9 @@ async def create_provider(
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
-                suggestion="Valid providers are: copilot, openai-agents, claude, claude-agent-sdk",
+                suggestion=(
+                    "Valid providers are: copilot, openai-agents, claude, claude-agent-sdk, hermes"
+                ),
             )
 
     if validate and not await provider.validate_connection():

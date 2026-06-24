@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.19...HEAD)
 
+### Added
+
+- **Hermes provider (experimental)** — optional third provider built on the
+  NousResearch [`hermes-agent`](https://github.com/NousResearch/hermes-agent)
+  library, which manages its own tool ecosystem (no MCP configuration). Install
+  separately with `pip install hermes-agent`; Conductor works without it.
+  Declared in the experimental provider tier with documented capability
+  carve-outs (no MCP servers, no per-agent workflow `tools:` allowlist,
+  structured output via prompt injection). Supports custom endpoints via
+  structured `runtime.provider` (`base_url` / `api_key`), `hermes_home`
+  profiles, `hermes_toolsets`, streaming + reasoning event callbacks,
+  cooperative interrupt, session-history resume, and `max_session_seconds`.
+  See [`docs/providers/hermes.md`](docs/providers/hermes.md).
+  ([#235](https://github.com/microsoft/conductor/pull/235))
+
 ## [0.1.19](https://github.com/microsoft/conductor/compare/v0.1.18...v0.1.19) - 2026-06-16
 
 ### Added

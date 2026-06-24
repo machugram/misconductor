@@ -614,7 +614,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude", "claude-agent-sdk"] | None = None
+    provider: Literal["copilot", "claude", "claude-agent-sdk", "hermes"] | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -623,6 +623,7 @@ class AgentDef(BaseModel):
 
     Example:
         provider: claude  # Use Claude for this agent
+        provider: hermes  # Use Hermes Agent for this agent
     """
 
     model: str | None = None
@@ -1576,7 +1577,7 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk"] = "copilot"
+    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"] = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
@@ -1606,12 +1607,66 @@ class ProviderSettings(BaseModel):
     """Bearer token. Takes precedence over ``api_key`` when both are set.
     Copilot-only."""
 
+    auth_token: SecretStr | None = None
+    """Bearer token for OAuth / gateway authentication. Claude-only.
+
+    Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK instead
+    of the usual ``x-api-key`` header. Use for Databricks AI Gateway,
+    LiteLLM proxies, or any endpoint that expects a bearer token.
+
+    Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var when not set in YAML.
+
+    Example::
+
+        provider:
+          name: claude
+          base_url: https://my-gateway.example.com/api/v1
+          auth_token: ${DATABRICKS_TOKEN}
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
     azure: AzureProviderOptions | None = None
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""
+
+    hermes_home: str | None = None
+    """Path to a Hermes home directory (profile). Hermes-only.
+
+    When set, the Hermes provider loads its config (soul, memory, toolsets)
+    from this path instead of the default ``~/.hermes``. Supports
+    ``${ENV_VAR}`` interpolation.
+
+    Example:
+        hermes_home: ~/.hermes-research
+    """
+
+    hermes_toolsets: list[str] | None = None
+    """Hermes toolset names to enable for all agents. Hermes-only.
+
+    When set, restricts which Hermes toolsets are available during agent
+    execution. ``None`` (default) = Hermes uses all available toolsets.
+    Empty list = no tools at all.
+
+    Example:
+        hermes_toolsets: [filesystem, web]
+    """
+
+    hermes_skip_memory: bool | None = None
+    """Skip loading Hermes memory files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (memory is loaded).
+    Set to ``True`` to explicitly disable memory for stateless workflows.
+    """
+
+    hermes_skip_context_files: bool | None = None
+    """Skip loading Hermes context/soul files during agent initialization. Hermes-only.
+
+    ``None`` (default) = the hermes-agent library default applies (context files
+    including SOUL.md are loaded, preserving the agent's persona).
+    Set to ``True`` to explicitly disable context file loading.
+    """
 
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
@@ -1622,6 +1677,9 @@ class ProviderSettings(BaseModel):
             "headers": self.headers,
             "azure": self.azure,
         }
+        claude_only_fields = {
+            "auth_token": self.auth_token,
+        }
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
             if extras:
@@ -1629,11 +1687,29 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-            if self.base_url is not None or self.api_key is not None:
-                raise ValueError(
-                    f"Structured provider config (base_url/api_key) for name='{self.name}' "
-                    "is not yet implemented; use environment variables for the underlying SDK."
-                )
+        if self.name not in ("copilot", "claude", "hermes") and (
+            self.base_url is not None or self.api_key is not None
+        ):
+            raise ValueError(
+                f"Structured provider config (base_url/api_key) for name='{self.name}' "
+                "is not yet implemented; use environment variables for the underlying SDK."
+            )
+        if self.name != "claude":
+            extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
+            if extras:
+                raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
+
+        if self.hermes_home is not None and self.name != "hermes":
+            raise ValueError("'hermes_home' is only supported when name='hermes'.")
+
+        if self.hermes_toolsets is not None and self.name != "hermes":
+            raise ValueError("'hermes_toolsets' is only supported when name='hermes'.")
+
+        if self.hermes_skip_memory is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_memory' is only supported when name='hermes'.")
+
+        if self.hermes_skip_context_files is not None and self.name != "hermes":
+            raise ValueError("'hermes_skip_context_files' is only supported when name='hermes'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
@@ -1646,7 +1722,11 @@ class ProviderSettings(BaseModel):
             raise ValueError(
                 "'headers' must contain at least one entry; remove the key to omit headers"
             )
-        for secret_field, value in (("api_key", self.api_key), ("bearer_token", self.bearer_token)):
+        for secret_field, value in (
+            ("api_key", self.api_key),
+            ("bearer_token", self.bearer_token),
+            ("auth_token", self.auth_token),
+        ):
             if value is not None and value.get_secret_value() == "":
                 raise ValueError(
                     f"'{secret_field}' is empty; remove the key or supply a value "
@@ -1695,6 +1775,7 @@ class ProviderSettings(BaseModel):
                 self.base_url,
                 self.api_key,
                 self.bearer_token,
+                self.auth_token,
                 self.headers,
                 self.azure,
             )
