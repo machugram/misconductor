@@ -83,9 +83,12 @@ def _build_output_format(output: dict[str, OutputField]) -> dict[str, Any]:
     }
 
 
-# Default tool preset granted when an agent does not declare a `tools:` list.
-# This mirrors the SDK's `claude_code` preset (filesystem, bash, web, etc.) —
-# i.e. the same behavior the user gets when running the `claude` CLI directly.
+# Default tool preset granted when an agent omits the `tools:` list. This
+# mirrors the SDK's `claude_code` preset (filesystem, bash, web, etc.) — i.e.
+# the same behavior the user gets when running the `claude` CLI directly. It is
+# selected from the RAW ``agent.tools is None`` signal, NOT from the executor's
+# resolved list: for an agent that declares no `tools:`, the executor returns the
+# workflow-tools copy, which is empty only when the workflow declares no `tools:`.
 _DEFAULT_TOOL_PRESET: dict[str, str] = {"type": "preset", "preset": "claude_code"}
 
 # Display-only previews for the verbose CLI pretty-printer (NOT surfaced
@@ -444,15 +447,24 @@ class ClaudeAgentSdkProvider(AgentProvider):
         identifiers. We therefore refuse to forward a non-empty allowlist
         to the SDK rather than silently grant the wrong native tools.
 
+        The ``tools`` argument is the executor's *resolved* list from
+        :func:`conductor.executor.agent.resolve_agent_tools`. That function
+        erases the distinction between an omitted ``tools:`` and an explicit
+        ``tools: []``: both arrive here as an empty list whenever the
+        workflow declares no workflow-level ``tools:`` (``config.tools`` is
+        empty; a non-empty list makes an omitted agent resolve non-empty). We
+        therefore consult the RAW ``agent.tools`` field — the only place the
+        omitted-vs-explicit signal survives — to pick the default.
+
         Semantics:
 
-        * ``tools is None`` — no allowlist declared. Fall back to the
-          ``claude_code`` preset (filesystem, bash, web) and bypass
-          permissions, matching what the user gets from the bare
-          ``claude`` CLI. Backward compatible.
-        * ``tools == []`` — explicit "no tools" request. Pass an empty
-          list to the SDK so all tools are disabled. Drop the permission
-          bypass because there are no tools to permit.
+        * ``tools`` empty (``[]`` or ``None``) and ``agent.tools is None`` —
+          the agent omitted ``tools:``. Fall back to the ``claude_code``
+          preset (filesystem, bash, web) and bypass permissions, matching
+          what the user gets from the bare ``claude`` CLI.
+        * ``tools`` empty and ``agent.tools == []`` — explicit "no tools"
+          request. Pass an empty list to the SDK so all tools are disabled.
+          Drop the permission bypass because there are no tools to permit.
         * ``tools`` non-empty — raise ``ProviderError``. Workflow tool
           name → CLI tool ID translation is not implemented (tracked as
           a follow-up). Silently dropping the allowlist would be a
@@ -460,8 +472,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
           the wrong native tool. Refuse loudly.
 
         Args:
-            tools: The workflow ``tools:`` allowlist for this agent.
-            agent: The agent definition (used for the error message).
+            tools: The executor-resolved ``tools:`` allowlist for this agent.
+            agent: The agent definition. ``agent.tools`` carries the raw
+                omitted-vs-explicit-empty signal; ``agent.name`` is used in
+                the error message.
 
         Returns:
             A ``(sdk_tools, permission_mode)`` tuple suitable for
@@ -470,18 +484,24 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Raises:
             ProviderError: If ``tools`` is a non-empty list.
         """
-        if tools is None:
-            return _DEFAULT_TOOL_PRESET, "bypassPermissions"
         if not tools:
+            # The executor passes [] for BOTH "omitted (no workflow tools to
+            # inherit)" and explicit "tools: []". Disambiguate via the raw
+            # per-agent field, which the executor's resolution erased.
+            if agent.tools is None:
+                # Omitted -> default claude_code preset (filesystem/bash/web).
+                return _DEFAULT_TOOL_PRESET, "bypassPermissions"
+            # Explicit `tools: []` -> no tools, no permission bypass.
             return [], None
         raise ProviderError(
-            f"Agent '{agent.name}' declares tools={tools!r}, but "
-            "claude-agent-sdk does not support per-agent workflow tool "
-            "allowlists (workflow tool names do not translate to Claude "
-            "CLI tool IDs).",
+            f"Agent '{agent.name}' resolves to tools={tools!r} (declared on "
+            "the agent or inherited from the workflow-level 'tools:' list), "
+            "but claude-agent-sdk does not support workflow tool allowlists "
+            "(workflow tool names do not translate to Claude CLI tool IDs).",
             suggestion=(
-                "Remove the 'tools:' field to grant the full claude_code "
-                "preset, or set 'tools: []' to disable all tools."
+                "Omit both the per-agent and workflow-level 'tools:' to grant "
+                "the full claude_code preset, or set 'tools: []' to disable "
+                "all tools."
             ),
         )
 

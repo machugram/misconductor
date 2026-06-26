@@ -48,10 +48,14 @@ def _build_workflow(
     parallel: list[ParallelGroup] | None = None,
     for_each: list[ForEachDef] | None = None,
     mcp_servers: dict[str, MCPServerDef] | None = None,
+    tools: list[str] | None = None,
 ) -> WorkflowConfig:
     runtime_kwargs: dict[str, Any] = {"provider": "copilot"}
     if mcp_servers is not None:
         runtime_kwargs["mcp_servers"] = mcp_servers
+    workflow_kwargs: dict[str, Any] = {}
+    if tools is not None:
+        workflow_kwargs["tools"] = tools
     return WorkflowConfig(
         workflow=WorkflowDef(
             name="test",
@@ -61,6 +65,7 @@ def _build_workflow(
         agents=agents,
         parallel=parallel or [],
         for_each=for_each or [],
+        **workflow_kwargs,
     )
 
 
@@ -142,6 +147,117 @@ class TestToolsAllowlistCrossCheck:
     def test_omitted_tools_against_no_passthrough_does_not_error(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
         config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)  # no raise
+
+    def test_omitted_tools_inherits_workflow_tools_against_no_passthrough_errors(
+        self, patch_caps: Any
+    ) -> None:
+        """Omitted ``tools:`` + non-empty workflow ``tools:`` + no passthrough.
+
+        An omitted per-agent ``tools:`` inherits the workflow-level list at
+        runtime; a non-passthrough provider would then refuse it at execute
+        time with a confusing "declares tools=[...]" error even though the
+        agent declared none. Catch it at validate time instead.
+        """
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi")],
+            tools=["search", "read_file"],
+        )
+        with pytest.raises(ConfigurationError, match="omits 'tools:' and would inherit"):
+            validate_workflow_config(config)
+
+    def test_explicit_empty_tools_with_workflow_tools_no_passthrough_passes(
+        self, patch_caps: Any
+    ) -> None:
+        """Explicit ``tools: []`` opts out of inheritance, so it stays valid."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_omitted_tools_inherits_workflow_tools_with_passthrough_passes(
+        self, patch_caps: Any
+    ) -> None:
+        """A passthrough provider honors the inherited list, so no error."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi")],
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+
+class TestForEachInlineToolsCrossCheck:
+    """The tools cross-check must also cover a for_each group's INLINE agent.
+
+    A ``for_each`` group carries an inline ``AgentDef`` that is NOT in
+    ``config.agents`` but runs at runtime with ``workflow_tools=config.tools``,
+    exactly like a top-level agent. Without an explicit pass it would slip past
+    ``validate`` and fail mid-iteration with the same confusing error.
+    """
+
+    def _for_each_config(
+        self,
+        *,
+        inline: AgentDef,
+        tools: list[str] | None = None,
+    ) -> WorkflowConfig:
+        # The entry agent opts out with ``tools: []`` so only the inline agent
+        # can trip the check — isolating the assertion to the for_each path.
+        return _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi", tools=[])],
+            tools=tools,
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                )
+            ],
+        )
+
+    def test_inline_omitted_tools_inherits_workflow_tools_errors(self, patch_caps: Any) -> None:
+        """Inline agent omits ``tools:`` + non-empty workflow ``tools:`` -> error."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            tools=["search"],
+        )
+        with pytest.raises(
+            ConfigurationError, match="Agent 'inner' omits 'tools:' and would inherit"
+        ):
+            validate_workflow_config(config)
+
+    def test_inline_explicit_empty_tools_passes(self, patch_caps: Any) -> None:
+        """Inline ``tools: []`` opts out of inheritance, so it stays valid."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
+            tools=["search"],
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_inline_explicit_nonempty_tools_errors(self, patch_caps: Any) -> None:
+        """An explicit non-empty inline allowlist against a non-passthrough provider errors."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=["search"]),
+        )
+        with pytest.raises(ConfigurationError, match="Agent 'inner' declares tools="):
+            validate_workflow_config(config)
+
+    def test_inline_omitted_tools_with_passthrough_passes(self, patch_caps: Any) -> None:
+        """A passthrough provider honors the inherited list, so no error."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=True)})
+        config = self._for_each_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}"),
+            tools=["search"],
+        )
         validate_workflow_config(config)  # no raise
 
 
