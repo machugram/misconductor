@@ -2582,6 +2582,109 @@ class TestClaudeGetMaxPromptTokens:
             assert await provider.get_max_prompt_tokens("claude-sonnet-4-5") is None
 
 
+@patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude.AsyncAnthropic")
+class TestClaudeGetModelCapabilities:
+    """Tests for ClaudeProvider.get_model_capabilities (#301)."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_model_reports_all_five_levels(self, mock_anthropic_class: Mock) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(data=[Mock(id="claude-sonnet-4-5", max_input_tokens=200_000)])
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        caps = await provider.get_model_capabilities("claude-sonnet-4-5")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh", "max"]
+        assert caps.default_reasoning_effort is None
+        assert caps.max_prompt_tokens == 200_000
+        assert caps.max_output_tokens is None
+        assert caps.max_context_window_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_non_thinking_model_reports_empty_list(self, mock_anthropic_class: Mock) -> None:
+        """An empty list is a definitive 'supports none', not 'unknown'."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(
+            return_value=Mock(
+                data=[Mock(id="claude-3-5-sonnet-20241022", max_input_tokens=200_000)]
+            )
+        )
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        caps = await provider.get_model_capabilities("claude-3-5-sonnet-20241022")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == []
+        assert caps.max_prompt_tokens == 200_000
+
+    @pytest.mark.asyncio
+    async def test_reasoning_fields_populated_even_when_prompt_tokens_unknown(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        """The reasoning heuristic is name-based and doesn't need a model match."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        caps = await provider.get_model_capabilities("claude-opus-4-20250514")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh", "max"]
+        assert caps.max_prompt_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_reasoning_fields_populated_when_sdk_call_fails(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        caps = await provider.get_model_capabilities("claude-3-opus-20240229")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == []
+        assert caps.max_prompt_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_reasoning_fields_populated_when_sdk_unavailable(
+        self, mock_anthropic_class: Mock
+    ) -> None:
+        """The reasoning-effort heuristic is a pure name match independent of
+        the SDK, so it stays populated even when ANTHROPIC_SDK_AVAILABLE is
+        False (get_max_prompt_tokens's own early-return path)."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        with patch("conductor.providers.claude.ANTHROPIC_SDK_AVAILABLE", False):
+            caps = await provider.get_model_capabilities("claude-sonnet-4-5")
+        assert caps is not None
+        assert caps.supported_reasoning_efforts == ["low", "medium", "high", "xhigh", "max"]
+        assert caps.max_prompt_tokens is None
+
+    @pytest.mark.asyncio
+    async def test_never_raises_for_non_string_model(self, mock_anthropic_class: Mock) -> None:
+        """A non-string model (a hypothetical caller bug) must not escape the
+        method's own guard — the reasoning-effort field degrades to unknown
+        rather than propagating an AttributeError. Use a truthy non-string
+        value (an int) since ``is_claude_thinking_model`` already short-
+        circuits falsy input like ``None`` or ``""`` without erroring."""
+        mock_client = Mock()
+        mock_client.models.list = AsyncMock(return_value=Mock(data=[]))
+        mock_anthropic_class.return_value = mock_client
+
+        provider = ClaudeProvider()
+        caps = await provider.get_model_capabilities(12345)  # type: ignore[arg-type]
+        assert caps is not None
+        assert caps.supported_reasoning_efforts is None
+
+
 class TestClaudeReasoningEffort:
     """Tests for extended-thinking / reasoning effort plumbing."""
 

@@ -24,7 +24,7 @@ import json
 import logging
 import random
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, get_args
 
 from pydantic import BaseModel
 
@@ -34,7 +34,13 @@ from conductor.providers._event_format import (
     extract_tool_result_text,
     format_tool_arguments,
 )
-from conductor.providers.base import AgentOutput, AgentProvider, EventCallback, match_model_id
+from conductor.providers.base import (
+    AgentOutput,
+    AgentProvider,
+    EventCallback,
+    ModelCapabilityInfo,
+    match_model_id,
+)
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import (
     CLAUDE_ANSWER_HEADROOM_TOKENS,
@@ -501,6 +507,58 @@ class ClaudeProvider(AgentProvider):
             logger.debug("Failed to list Anthropic models: %s", e)
             return None
         return [model.id for model in page.data]
+
+    async def get_model_capabilities(self, model: str) -> ModelCapabilityInfo | None:
+        """Return reasoning-effort support and prompt-token limits for ``model``.
+
+        Implements the :meth:`AgentProvider.get_model_capabilities` hook (see
+        #301).
+
+        Reasoning-effort support is derived from the same static heuristic
+        used to gate extended thinking (:func:`is_claude_thinking_model`):
+        thinking-capable models (Claude 3.7+ / 4.x) advertise all five
+        :data:`ReasoningEffort` levels; other models advertise an empty list
+        — a definitive "supports none", not "unknown". Anthropic has no
+        notion of a model-specific *default* effort (unlike the Copilot SDK),
+        so ``default_reasoning_effort`` is always ``None``.
+
+        ``max_prompt_tokens`` reuses :meth:`get_max_prompt_tokens` (the
+        Anthropic SDK's ``max_input_tokens``). ``max_output_tokens`` and
+        ``max_context_window_tokens`` are always ``None`` — the Anthropic
+        SDK's ``models.list()`` exposes no output/total-context split.
+
+        Unlike :meth:`get_max_prompt_tokens` (which only catches its
+        documented ``(TimeoutError, AnthropicError, OSError)`` tuple and lets
+        anything else propagate, by design, for its own caller), this hook
+        upholds the base class's stricter "never raise" contract on its own:
+        each field is resolved behind its own guard, so a failure in one
+        (e.g. an unexpected exception from the delegated
+        ``get_max_prompt_tokens`` call, or a non-string ``model``) degrades
+        only that field rather than the whole result or the caller. The
+        reasoning-effort fields are populated even when the SDK is
+        unavailable, ``model`` can't be resolved, or the token-limit lookup
+        fails (the heuristic is a pure name match independent of the SDK
+        call), so this never returns ``None`` outright.
+        """
+        try:
+            supported_reasoning_efforts = (
+                list(get_args(ReasoningEffort)) if is_claude_thinking_model(model) else []
+            )
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve reasoning-effort support for %r: %s", model, e)
+            supported_reasoning_efforts = None
+        try:
+            max_prompt_tokens = await self.get_max_prompt_tokens(model)
+        except Exception as e:  # noqa: BLE001 - diagnostics must never raise
+            logger.debug("Failed to resolve max_prompt_tokens for %r: %s", model, e)
+            max_prompt_tokens = None
+        return ModelCapabilityInfo(
+            supported_reasoning_efforts=supported_reasoning_efforts,
+            default_reasoning_effort=None,
+            max_prompt_tokens=max_prompt_tokens,
+            max_output_tokens=None,
+            max_context_window_tokens=None,
+        )
 
     async def _ensure_mcp_connected(self) -> None:
         """Connect to MCP servers if configured.
