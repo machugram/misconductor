@@ -482,6 +482,90 @@ function createSubworkflowContext(parentAgent: string, iteration: number, workfl
   };
 }
 
+/**
+ * Shallow-clone a single SubworkflowContext's own mutable containers
+ * (`nodes`, `groupProgress`, `routes`, `highlightedEdges`, `children`,
+ * `agents`, `parallelGroups`, `forEachGroups`, `eventLog`, `activityLog`).
+ * Grandchildren inside `children` are NOT deep-cloned — callers that need to
+ * descend further re-clone the next level themselves (see
+ * `resolveMutableContext`), leaving untouched sibling subtrees at their
+ * existing references.
+ */
+function cloneContextShallow(ctx: SubworkflowContext): SubworkflowContext {
+  return {
+    ...ctx,
+    agents: [...ctx.agents],
+    routes: [...ctx.routes],
+    parallelGroups: [...ctx.parallelGroups],
+    forEachGroups: [...ctx.forEachGroups],
+    nodes: { ...ctx.nodes },
+    groupProgress: { ...ctx.groupProgress },
+    highlightedEdges: [...ctx.highlightedEdges],
+    eventLog: [...ctx.eventLog],
+    activityLog: [...ctx.activityLog],
+    children: [...ctx.children],
+  };
+}
+
+/**
+ * Clone-on-write along a single index path into the SubworkflowContext tree.
+ *
+ * React/Zustand only re-render on a reference change, so any container a
+ * handler mutates needs a fresh reference for the update to be noticed.
+ * `processEvent` already does this for root-level `nodes`/`groupProgress`/
+ * `eventLog`/`activityLog` on every event. Event handlers reached through
+ * `activeTarget()` mutate the equivalent containers *inside* a resolved
+ * `SubworkflowContext` — this helper gives them the same guarantee, but
+ * scoped to just the branch being touched: only the top-level array and the
+ * ancestor chain down to (and including) `indexPath` get a new reference.
+ * Every sibling subtree, including its own unmodified descendants, keeps
+ * its existing reference, so unrelated selectors/`useMemo` calls don't
+ * spuriously recompute on events that don't touch them.
+ *
+ * Mutates `state.subworkflowContexts` in place with the freshly-spliced
+ * clone and returns the cloned context at the end of `indexPath` (or `null`
+ * if `indexPath` is empty or doesn't resolve — the top-level array is still
+ * cloned in that case, which callers rely on before pushing a new root-level
+ * context, e.g. `subworkflow_started`).
+ */
+function resolveMutableContext(state: MutableState, indexPath: number[]): SubworkflowContext | null {
+  function cloneSpine(contexts: SubworkflowContext[], path: number[]): { contexts: SubworkflowContext[]; ctx: SubworkflowContext | null } {
+    const newContexts = [...contexts];
+    if (path.length === 0) return { contexts: newContexts, ctx: null };
+    const idx = path[0]!;
+    const original = newContexts[idx];
+    if (!original) return { contexts: newContexts, ctx: null };
+    const cloned = cloneContextShallow(original);
+    if (path.length > 1) {
+      const childResult = cloneSpine(original.children, path.slice(1));
+      cloned.children = childResult.contexts;
+      newContexts[idx] = cloned;
+      return { contexts: newContexts, ctx: childResult.ctx };
+    }
+    newContexts[idx] = cloned;
+    return { contexts: newContexts, ctx: cloned };
+  }
+
+  const result = cloneSpine(state.subworkflowContexts, indexPath);
+  state.subworkflowContexts = result.contexts;
+  return result.ctx;
+}
+
+/**
+ * Slot-path variant of `resolveMutableContext`: resolves `slotPath` via
+ * `resolveSlotPath` (read-only) and then clones the spine for mutation.
+ * Returns the resolved `indexPath` alongside the freshly-cloned `ctx`.
+ */
+function resolveMutableSlotPath(
+  state: MutableState,
+  slotPath: string[],
+): { indexPath: number[]; ctx: SubworkflowContext | null } | null {
+  const resolved = resolveSlotPath(state.subworkflowContexts, slotPath);
+  if (!resolved) return null;
+  const ctx = resolveMutableContext(state, resolved.indexPath);
+  return { indexPath: resolved.indexPath, ctx };
+}
+
 /** Resolve a SubworkflowContext from a path of indices (e.g. [0, 2] = first child's third child). */
 function resolveContext(contexts: SubworkflowContext[], path: number[]): SubworkflowContext | null {
   if (path.length === 0) return null;
@@ -671,7 +755,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   processEvent: (event: WorkflowEvent) => {
     const handler = eventHandlers[event.type];
     set((state) => {
-      const newState = { ...state, nodes: { ...state.nodes }, groupProgress: { ...state.groupProgress }, eventLog: [...state.eventLog], activityLog: [...state.activityLog], lastEventTime: event.timestamp };
+      const newState = {
+        ...state,
+        nodes: { ...state.nodes },
+        groupProgress: { ...state.groupProgress },
+        eventLog: [...state.eventLog],
+        activityLog: [...state.activityLog],
+        lastEventTime: event.timestamp,
+      };
       if (handler) {
         handler(newState, event.data, event.timestamp);
       }
@@ -978,7 +1069,7 @@ function activeTarget(
   let ctx: SubworkflowContext | null = null;
   const subPath = data?.subworkflow_path;
   if (Array.isArray(subPath) && subPath.length > 0) {
-    ctx = resolveSlotPath(state.subworkflowContexts, subPath as string[])?.ctx ?? null;
+    ctx = resolveMutableSlotPath(state, subPath as string[])?.ctx ?? null;
   }
   if (ctx) {
     const ctxRef = ctx;
@@ -1069,8 +1160,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // in which ctx.
       const subPath = (_data as Record<string, unknown>).subworkflow_path;
       const ctx = Array.isArray(subPath) && subPath.length > 0
-        ? resolveSlotPath(state.subworkflowContexts, subPath as string[])?.ctx ?? null
-        : resolveContext(state.subworkflowContexts, state.activeContextPath);
+        ? resolveMutableSlotPath(state, subPath as string[])?.ctx ?? null
+        : resolveMutableContext(state, state.activeContextPath);
       if (ctx) {
         ctx.workflowName = data.name || '';
         ctx.status = 'running';
@@ -1603,8 +1694,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       // sibling start.
       const data = _data as { output?: unknown; subworkflow_path?: string[] };
       const ctx = data.subworkflow_path
-        ? resolveSlotPath(state.subworkflowContexts, data.subworkflow_path)?.ctx
-        : resolveContext(state.subworkflowContexts, state.activeContextPath);
+        ? resolveMutableSlotPath(state, data.subworkflow_path)?.ctx
+        : resolveMutableContext(state, state.activeContextPath);
       if (ctx) {
         ctx.status = 'completed';
         ctx.workflowOutput = data.output ?? null;
@@ -1680,8 +1771,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       }
     } else {
       const ctx = data.subworkflow_path
-        ? resolveSlotPath(state.subworkflowContexts, data.subworkflow_path)?.ctx
-        : resolveContext(state.subworkflowContexts, state.activeContextPath);
+        ? resolveMutableSlotPath(state, data.subworkflow_path)?.ctx
+        : resolveMutableContext(state, state.activeContextPath);
       if (ctx) {
         ctx.status = 'failed';
         ctx.workflowFailure = { error_type: data.error_type, message: data.message };
@@ -1734,14 +1825,19 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const wasAtLiveEdge = false;
 
     let newActivePath: number[];
+    let parentCtx: SubworkflowContext | null = null;
     if (parentIndexPath.length === 0) {
+      // Clone the top-level array before pushing so subworkflowContexts gets
+      // a fresh reference (resolveMutableContext with an empty path still
+      // clones the top array; it just has no context to descend into).
+      resolveMutableContext(state, []);
       state.subworkflowContexts.push(ctx);
       newActivePath = [state.subworkflowContexts.length - 1];
     } else {
-      const parent = resolveContext(state.subworkflowContexts, parentIndexPath);
-      if (!parent) return;
-      parent.children.push(ctx);
-      newActivePath = [...parentIndexPath, parent.children.length - 1];
+      parentCtx = resolveMutableContext(state, parentIndexPath);
+      if (!parentCtx) return;
+      parentCtx.children.push(ctx);
+      newActivePath = [...parentIndexPath, parentCtx.children.length - 1];
     }
     state.activeContextPath = newActivePath;
     if (wasAtLiveEdge) {
@@ -1758,14 +1854,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         nd.status = 'running';
         replaceNode(state.nodes, data.agent_name);
       }
-    } else {
-      const parentCtx = resolveContext(state.subworkflowContexts, parentIndexPath);
-      if (parentCtx) {
-        const nd = parentCtx.nodes[data.agent_name];
-        if (nd) {
-          nd.status = 'running';
-          replaceNode(parentCtx.nodes, data.agent_name);
-        }
+    } else if (parentCtx) {
+      const nd = parentCtx.nodes[data.agent_name];
+      if (nd) {
+        nd.status = 'running';
+        replaceNode(parentCtx.nodes, data.agent_name);
       }
     }
   },
@@ -1788,10 +1881,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       parentIndexPath = state.activeContextPath;
     }
 
-    const targetNodes =
-      parentIndexPath.length === 0
-        ? state.nodes
-        : resolveContext(state.subworkflowContexts, parentIndexPath)?.nodes;
+    const parentCtx = parentIndexPath.length === 0 ? null : resolveMutableContext(state, parentIndexPath);
+    const targetNodes = parentIndexPath.length === 0 ? state.nodes : parentCtx?.nodes;
     if (targetNodes) {
       const nd = targetNodes[data.agent_name];
       if (nd) {
@@ -1803,9 +1894,8 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           nd.elapsed = data.elapsed;
           if (parentIndexPath.length === 0) {
             state.agentsCompleted++;
-          } else {
-            const parentCtx = resolveContext(state.subworkflowContexts, parentIndexPath);
-            if (parentCtx) parentCtx.agentsCompleted++;
+          } else if (parentCtx) {
+            parentCtx.agentsCompleted++;
           }
         }
         replaceNode(targetNodes, data.agent_name);
@@ -1834,7 +1924,7 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const targetNodes =
       parentIndexPath.length === 0
         ? state.nodes
-        : resolveContext(state.subworkflowContexts, parentIndexPath)?.nodes;
+        : resolveMutableContext(state, parentIndexPath)?.nodes;
     if (targetNodes) {
       const nd = targetNodes[data.agent_name];
       if (nd && data.item_key == null) {
