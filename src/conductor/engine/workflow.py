@@ -11,6 +11,7 @@ import contextlib
 import copy
 import json
 import logging
+import os
 import sys
 import time as _time
 import uuid
@@ -483,6 +484,48 @@ class WorkflowEngine:
     def _workflow_dir(self) -> Path | None:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
+
+    def _resolve_agent_working_dir(
+        self, agent: AgentDef, agent_context: dict[str, Any]
+    ) -> AgentDef:
+        """Resolve an agent's effective ``working_dir`` and return an updated copy.
+
+        Precedence is ``agent.working_dir`` over ``runtime.working_dir``; the
+        chosen raw value is Jinja-rendered against the per-agent context (so
+        both levels support templates, e.g. ``{{ item }}`` in for-each), then
+        ``~``-expanded, made absolute against the workflow file's directory
+        (falling back to the process cwd), and lexically normalised with
+        :func:`os.path.normpath` (``resolve()`` is deliberately not used so
+        symlink aliases stay distinct). A missing directory raises
+        :class:`ExecutionError` before any provider call. When neither level
+        sets a value the agent is returned unchanged (``working_dir=None`` and
+        the provider uses its own cwd).
+        """
+        raw = agent.working_dir
+        if raw is None:
+            raw = self.config.workflow.runtime.working_dir
+        if raw is None:
+            return agent
+
+        rendered = self.renderer.render(raw, agent_context)
+        path = Path(rendered).expanduser()
+        if not path.is_absolute():
+            base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
+            path = base / path
+        resolved = os.path.normpath(path)
+
+        if not Path(resolved).is_dir():
+            raise ExecutionError(
+                f"Agent '{agent.name}': working_dir '{resolved}' does not exist or "
+                f"is not a directory (rendered from '{raw}')",
+                agent_name=agent.name,
+                suggestion=(
+                    "Create the directory before the agent runs (e.g. via a "
+                    "script step) or fix the working_dir template."
+                ),
+            )
+
+        return agent.model_copy(update={"working_dir": resolved})
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
@@ -1911,18 +1954,24 @@ class WorkflowEngine:
         # provider raising here must not break the (failure or periodic)
         # checkpoint save, so the "never raises" contract holds for both paths.
         copilot_session_ids: dict[str, str] | None = None
+        copilot_session_cwds: dict[str, str] | None = None
         try:
             provider = self._single_provider
             if provider is not None and hasattr(provider, "get_session_ids"):
                 copilot_session_ids = provider.get_session_ids()  # type: ignore[union-attr]
+                if hasattr(provider, "get_session_cwds"):
+                    copilot_session_cwds = provider.get_session_cwds()  # type: ignore[union-attr]
             elif self._registry is not None:
                 for p in self._registry.get_active_providers().values():
                     if hasattr(p, "get_session_ids"):
                         copilot_session_ids = p.get_session_ids()  # type: ignore[union-attr]
+                        if hasattr(p, "get_session_cwds"):
+                            copilot_session_cwds = p.get_session_cwds()  # type: ignore[union-attr]
                         break
         except Exception:
             logger.warning("Failed to collect provider session IDs for checkpoint", exc_info=True)
             copilot_session_ids = None
+            copilot_session_cwds = None
 
         return CheckpointManager.save_checkpoint(
             workflow_path=self.workflow_path,
@@ -1932,6 +1981,7 @@ class WorkflowEngine:
             error=error,
             inputs=self.context.workflow_inputs,
             copilot_session_ids=copilot_session_ids,
+            copilot_session_cwds=copilot_session_cwds,
             system_metadata=self._system_metadata,
             instructions_preamble=self._instructions_preamble,
             run_id=self._run_context.run_id,
@@ -3073,20 +3123,47 @@ class WorkflowEngine:
                             self.limits.get_agent_execution_count(agent.name) + 1
                         )
 
-                        self._emit(
-                            "agent_started",
-                            {
-                                "agent_name": agent.name,
-                                "iteration": agent_execution_count,
-                                "agent_type": agent.type or "agent",
-                                "context_window_max": await self._get_context_window_for_agent(
-                                    agent
-                                ),
-                            },
+                        # Trim context BEFORE building the per-agent context and
+                        # BEFORE agent_started so a max_tokens workflow emits the
+                        # start event with the prompt already trimmed (issue:
+                        # working_dir ordering). Trim is context-local — nothing
+                        # between the old (post-agent_started) and new position
+                        # reads the untrimmed context.
+                        self._trim_context_if_needed()
+
+                        # Build the per-agent context once for every step type;
+                        # the type-specific branches below reuse it instead of
+                        # re-building (human_gate still prefers the full-template
+                        # context and overwrites this local).
+                        agent_context = self.context.build_for_agent(
+                            agent.name,
+                            agent.input,
+                            mode=self.config.workflow.context.mode,
+                            agent_type=agent.type,
                         )
 
-                        # Trim context if max_tokens is configured
-                        self._trim_context_if_needed()
+                        # Resolve working_dir only for provider-backed LLM agents
+                        # (type None/"agent"). wait/set/terminate/human_gate/
+                        # workflow are schema-rejected from declaring one, and
+                        # script resolves its own in ScriptExecutor.
+                        is_llm_agent = agent.type in (None, "agent")
+                        resolved_agent = (
+                            self._resolve_agent_working_dir(agent, agent_context)
+                            if is_llm_agent
+                            else agent
+                        )
+
+                        started_payload: dict[str, Any] = {
+                            "agent_name": agent.name,
+                            "iteration": agent_execution_count,
+                            "agent_type": agent.type or "agent",
+                            "context_window_max": await self._get_context_window_for_agent(
+                                resolved_agent
+                            ),
+                        }
+                        if is_llm_agent:
+                            started_payload["working_dir"] = resolved_agent.working_dir
+                        self._emit("agent_started", started_payload)
 
                         # Handle terminate steps — explicit workflow exit with a
                         # structured reason and status. Reached via a normal
@@ -3097,12 +3174,6 @@ class WorkflowEngine:
                         # evaluated after.
                         if agent.type == "terminate":
                             terminate_elapsed = _time.time() - _workflow_start
-                            agent_context = self.context.build_for_agent(
-                                agent.name,
-                                agent.input,
-                                mode=self.config.workflow.context.mode,
-                                agent_type=agent.type,
-                            )
                             # Render the reason against context first so the
                             # rendered value is available to output_template
                             # and to the workflow-level output: fallback.
@@ -3289,12 +3360,6 @@ class WorkflowEngine:
 
                         # Handle script steps
                         if agent.type == "script":
-                            agent_context = self.context.build_for_agent(
-                                agent.name,
-                                agent.input,
-                                mode=self.config.workflow.context.mode,
-                                agent_type=agent.type,
-                            )
                             _script_start = _time.time()
 
                             # Count how many times this specific script has been executed
@@ -3438,12 +3503,6 @@ class WorkflowEngine:
 
                         # Handle wait steps
                         if agent.type == "wait":
-                            agent_context = self.context.build_for_agent(
-                                agent.name,
-                                agent.input,
-                                mode=self.config.workflow.context.mode,
-                                agent_type=agent.type,
-                            )
                             _wait_start = _time.time()
 
                             wait_execution_count = (
@@ -3580,13 +3639,6 @@ class WorkflowEngine:
                         # Handle set steps. Pure context transformations:
                         # render, coerce, validate, emit, route.
                         if agent.type == "set":
-                            agent_context = self.context.build_for_agent(
-                                agent.name,
-                                agent.input,
-                                mode=self.config.workflow.context.mode,
-                                agent_type=agent.type,
-                            )
-
                             set_output = await self._run_set_step(agent, agent_context)
                             self.context.store(agent.name, set_output.value)
                             self.limits.record_execution(agent.name)
@@ -3635,12 +3687,6 @@ class WorkflowEngine:
 
                         # Handle sub-workflow steps
                         if agent.type == "workflow":
-                            agent_context = self.context.build_for_agent(
-                                agent.name,
-                                agent.input,
-                                mode=self.config.workflow.context.mode,
-                                agent_type=agent.type,
-                            )
                             _sub_start = _time.time()
 
                             sub_execution_count = (
@@ -3725,23 +3771,20 @@ class WorkflowEngine:
                                 )
                             continue
 
-                        # Build context for this agent
-                        agent_context = self.context.build_for_agent(
-                            agent.name,
-                            agent.input,
-                            mode=self.config.workflow.context.mode,
-                            agent_type=agent.type,
-                        )
-
-                        # Execute agent (get executor for multi-provider support)
+                        # Execute agent (get executor for multi-provider support).
+                        # resolved_agent carries the engine-resolved working_dir;
+                        # agent_context was built (and trimmed) above, before
+                        # agent_started. Subsequent model_copy(update={...}) calls
+                        # inside AgentExecutor merge, so the resolved working_dir
+                        # survives to the provider.
                         _agent_start = _time.time()
-                        executor = await self._get_executor_for_agent(agent)
+                        executor = await self._get_executor_for_agent(resolved_agent)
                         guidance_section = self.context.get_guidance_prompt_section()
                         event_callback = self._make_event_callback(agent.name)
                         output = await self._execute_with_agent_timeout(
-                            agent,
+                            resolved_agent,
                             executor.execute(
-                                agent,
+                                resolved_agent,
                                 agent_context,
                                 guidance_section=guidance_section,
                                 interrupt_signal=self._interrupt_event,
@@ -3771,7 +3814,7 @@ class WorkflowEngine:
                                     self._interrupt_event.clear()
                                 continue
                             output = await self._handle_partial_output(
-                                agent,
+                                resolved_agent,
                                 output,
                                 agent_context,
                                 guidance_section,
@@ -3783,7 +3826,7 @@ class WorkflowEngine:
                         # Dialog mode: evaluate whether agent should enter dialog
                         if agent.dialog and not output.partial:
                             output = await self._handle_dialog(
-                                agent,
+                                resolved_agent,
                                 output,
                                 agent_context,
                                 executor,
@@ -3793,7 +3836,7 @@ class WorkflowEngine:
                         # Validator: grade output and re-run once on failure
                         if agent.validator and not output.partial:
                             output = await self._apply_validator(
-                                agent,
+                                resolved_agent,
                                 output,
                                 _agent_elapsed,
                                 agent_context,
@@ -3804,7 +3847,7 @@ class WorkflowEngine:
                             _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
-                        await self._ensure_pricing_resolved(agent, output.model)
+                        await self._ensure_pricing_resolved(resolved_agent, output.model)
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
                         output_keys = (
@@ -3825,7 +3868,7 @@ class WorkflowEngine:
                                 "output_keys": output_keys,
                                 "context_window_used": output.input_tokens,
                                 "context_window_max": await self._get_context_window_for_agent(
-                                    agent, output
+                                    resolved_agent, output
                                 ),
                             },
                         )
@@ -3841,7 +3884,7 @@ class WorkflowEngine:
                         self._check_budget()
 
                         # Evaluate routes using the Router
-                        route_result = self._evaluate_routes(agent, output.content)
+                        route_result = self._evaluate_routes(resolved_agent, output.content)
 
                         self._emit(
                             "route_taken",
@@ -4836,13 +4879,30 @@ class WorkflowEngine:
                     )
                     return (agent.name, set_output.value)
 
+                # Resolve working_dir for provider-backed LLM agents against
+                # this agent's own (pre-group snapshot) context. `set` steps
+                # returned above; other types in a parallel group are LLM agents.
+                resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
+
+                # LLM-only per-member start event: emitted only here (after the
+                # per-agent resolution) so ``working_dir`` is the resolved value;
+                # the pre-context envelope ``parallel_started`` stays unchanged.
+                self._emit(
+                    "parallel_agent_started",
+                    {
+                        "group_name": parallel_group.name,
+                        "agent_name": agent.name,
+                        "working_dir": resolved_agent.working_dir,
+                    },
+                )
+
                 # Execute agent (get executor for multi-provider support)
-                executor = await self._get_executor_for_agent(agent)
+                executor = await self._get_executor_for_agent(resolved_agent)
                 event_callback = self._make_event_callback(agent.name)
                 output = await self._execute_with_agent_timeout(
-                    agent,
+                    resolved_agent,
                     executor.execute(
-                        agent,
+                        resolved_agent,
                         agent_context,
                         event_callback=event_callback,
                     ),
@@ -4850,9 +4910,9 @@ class WorkflowEngine:
                 _agent_elapsed = _time.time() - _agent_start
 
                 # Validator: grade output and re-run once on failure
-                if agent.validator and not output.partial:
+                if resolved_agent.validator and not output.partial:
                     output = await self._apply_validator(
-                        agent,
+                        resolved_agent,
                         output,
                         _agent_elapsed,
                         agent_context,
@@ -4863,7 +4923,7 @@ class WorkflowEngine:
                     _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(agent, output.model)
+                await self._ensure_pricing_resolved(resolved_agent, output.model)
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
 
                 self._emit(
@@ -4877,7 +4937,7 @@ class WorkflowEngine:
                         "cost_usd": usage.cost_usd,
                         "context_window_used": output.input_tokens,
                         "context_window_max": await self._get_context_window_for_agent(
-                            agent, output
+                            resolved_agent, output
                         ),
                     },
                 )
@@ -5293,8 +5353,6 @@ class WorkflowEngine:
                     )
                     return (key, set_output.value)
 
-                executor = await self._get_executor_for_agent(for_each_group.agent)
-
                 # Qualify the per-iteration agent name so that any verbose
                 # provider-side logging (e.g. CopilotProvider tool/reasoning
                 # lines) can attribute interleaved output to a specific
@@ -5303,6 +5361,27 @@ class WorkflowEngine:
                 qualified_agent = for_each_group.agent.model_copy(
                     update={"name": f"{for_each_group.agent.name}[{key}]"}
                 )
+
+                # Resolve working_dir AFTER loop variables were injected into
+                # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
+                # the path resolves to this iteration's value.
+                qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
+
+                # LLM-only per-item start event: emitted only here (after the
+                # per-item resolution) so ``working_dir`` is the resolved value;
+                # the pre-context envelope ``for_each_item_started`` stays
+                # unchanged.
+                self._emit(
+                    "for_each_agent_started",
+                    {
+                        "group_name": for_each_group.name,
+                        "agent_name": qualified_agent.name,
+                        "item_key": key,
+                        "working_dir": qualified_agent.working_dir,
+                    },
+                )
+
+                executor = await self._get_executor_for_agent(qualified_agent)
 
                 # Item-scoped event callback that tags all streaming events
                 # with the for-each group name + item_key. Wrapper keys are
